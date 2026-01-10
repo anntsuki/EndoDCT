@@ -268,6 +268,7 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     teacher_model_path = args.teacher_model_path
     if not teacher_model_path:
         raise RuntimeError("--teacher_model_path is required for distill_dct")
+    student_model_path = args.student_model_path or teacher_model_path
 
     cfg_path = os.path.join(teacher_model_path, "cfg_args")
     if os.path.exists(cfg_path):
@@ -309,12 +310,15 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
 
     # Student gaussians (DCT)
     student_gaussians = GaussianModel(dataset.sh_degree, hyper)
-    iter_dir = os.path.join(teacher_model_path, "point_cloud", f"iteration_{iteration}")
+    iter_dir = os.path.join(student_model_path, "point_cloud", f"iteration_{iteration}")
     if not os.path.exists(iter_dir):
-        iter_dir = os.path.join(teacher_model_path, "point_cloud", f"coarse_iteration_{iteration}")
+        iter_dir = os.path.join(student_model_path, "point_cloud", f"coarse_iteration_{iteration}")
     student_gaussians.load_ply(os.path.join(iter_dir, "point_cloud.ply"))
     student_gaussians.load_model(iter_dir)
-    if student_gaussians._trajectory_coeffs is None:
+    if student_gaussians.dct_use_codebook_pos:
+        if student_gaussians._dct_codebook_pos is None or student_gaussians._dct_codebook_indices_pos is None:
+            raise RuntimeError("DCT pos codebook requested but missing in dct_coeffs.pth")
+    elif student_gaussians._trajectory_coeffs is None:
         student_gaussians._trajectory_coeffs = torch.nn.Parameter(
             torch.zeros((student_gaussians.get_xyz.shape[0], student_gaussians.dct_k, 3), device="cuda").requires_grad_(True)
         )
@@ -338,13 +342,27 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     for p in student_gaussians._deformation.parameters():
         p.requires_grad_(False)
 
-    params = [student_gaussians._trajectory_coeffs]
+    params = []
+    if student_gaussians.dct_use_codebook_pos:
+        params.append(student_gaussians._dct_codebook_pos)
+        if student_gaussians._dct_codebook_residual_pos is not None:
+            params.append(student_gaussians._dct_codebook_residual_pos)
+    else:
+        params.append(student_gaussians._trajectory_coeffs)
     if student_gaussians.dct_use_gate and student_gaussians._dct_log_alpha is not None:
         params.append(student_gaussians._dct_log_alpha)
     if student_gaussians._trajectory_coeffs_scale is not None:
         params.append(student_gaussians._trajectory_coeffs_scale)
     if student_gaussians._trajectory_coeffs_rot is not None:
         params.append(student_gaussians._trajectory_coeffs_rot)
+    if student_gaussians.dct_use_codebook_scale and student_gaussians._dct_codebook_scale is not None:
+        params.append(student_gaussians._dct_codebook_scale)
+        if student_gaussians._dct_codebook_residual_scale is not None:
+            params.append(student_gaussians._dct_codebook_residual_scale)
+    if student_gaussians.dct_use_codebook_rot and student_gaussians._dct_codebook_rot is not None:
+        params.append(student_gaussians._dct_codebook_rot)
+        if student_gaussians._dct_codebook_residual_rot is not None:
+            params.append(student_gaussians._dct_codebook_residual_rot)
     if args.dct_xyz_lr_mult > 0:
         student_gaussians._xyz.requires_grad_(True)
         params.append(student_gaussians._xyz)
@@ -358,6 +376,12 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     base_lr = opt.deformation_lr_init * student_gaussians.spatial_lr_scale
     lr_map = {
         id(student_gaussians._trajectory_coeffs): base_lr * args.dct_lr_mult,
+        id(student_gaussians._dct_codebook_pos): base_lr * args.dct_lr_mult,
+        id(student_gaussians._dct_codebook_residual_pos): base_lr * args.dct_lr_mult,
+        id(student_gaussians._dct_codebook_scale): base_lr * args.dct_lr_mult,
+        id(student_gaussians._dct_codebook_residual_scale): base_lr * args.dct_lr_mult,
+        id(student_gaussians._dct_codebook_rot): base_lr * args.dct_lr_mult,
+        id(student_gaussians._dct_codebook_residual_rot): base_lr * args.dct_lr_mult,
         id(student_gaussians._dct_log_alpha): base_lr * args.dct_lr_mult,
         id(student_gaussians._trajectory_coeffs_scale): base_lr * args.dct_lr_mult,
         id(student_gaussians._trajectory_coeffs_rot): base_lr * args.dct_lr_mult,
@@ -518,6 +542,7 @@ if __name__ == "__main__":
     parser.add_argument("--configs", type=str, default = "")
     parser.add_argument("--distill_dct", action="store_true", default=False)
     parser.add_argument("--teacher_model_path", type=str, default=None)
+    parser.add_argument("--student_model_path", type=str, default=None)
     parser.add_argument("--distill_iteration", type=int, default=-1)
     parser.add_argument("--distill_iterations", type=int, default=2000)
     parser.add_argument("--dct_gate_lambda", type=float, default=0.0)
@@ -528,6 +553,13 @@ if __name__ == "__main__":
     parser.add_argument("--dct_lr_decay_gamma", type=float, default=0.3)
     parser.add_argument("--distill_unfreeze_all", action="store_true", default=False)
     parser.add_argument("--distill_unfreeze_lr_mult", type=float, default=0.01)
+    parser.add_argument("--dct_use_codebook_pos", action="store_true", default=False)
+    parser.add_argument("--dct_use_codebook_scale", action="store_true", default=False)
+    parser.add_argument("--dct_use_codebook_rot", action="store_true", default=False)
+    parser.add_argument("--dct_codebook_size_pos", type=int, default=256)
+    parser.add_argument("--dct_codebook_size_scale", type=int, default=256)
+    parser.add_argument("--dct_codebook_size_rot", type=int, default=256)
+    parser.add_argument("--dct_expand_codebook", action="store_true", default=False)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     if args.configs:

@@ -77,6 +77,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dct_expand_codebook", action="store_true", default=False)
     ap.add_argument("--json", action="store_true", help="print JSON only")
     args = ap.parse_args()
 
@@ -113,6 +114,8 @@ def main():
     pipe_params = PipelineParams(parser)
     hyper_params = ModelHiddenParams(parser)
 
+    if args.dct_expand_codebook:
+        setattr(cfg, "dct_expand_codebook", True)
     dataset = model_params.extract(cfg) if hasattr(model_params, "extract") else cfg
     pipe = pipe_params.extract(cfg) if hasattr(pipe_params, "extract") else cfg
     hyper = hyper_params.extract(cfg) if hasattr(hyper_params, "extract") else cfg

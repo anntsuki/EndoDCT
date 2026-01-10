@@ -55,11 +55,27 @@ class GaussianModel:
         self.dct_gate_init = float(getattr(args, "dct_gate_init", 0.0))
         self.dct_use_scale = getattr(args, "dct_use_scale", False)
         self.dct_use_rot = getattr(args, "dct_use_rot", False)
+        self.dct_use_codebook_pos = getattr(args, "dct_use_codebook_pos", False)
+        self.dct_use_codebook_scale = getattr(args, "dct_use_codebook_scale", False)
+        self.dct_use_codebook_rot = getattr(args, "dct_use_codebook_rot", False)
+        self.dct_codebook_size_pos = int(getattr(args, "dct_codebook_size_pos", 256))
+        self.dct_codebook_size_scale = int(getattr(args, "dct_codebook_size_scale", 256))
+        self.dct_codebook_size_rot = int(getattr(args, "dct_codebook_size_rot", 256))
+        self.dct_expand_codebook = getattr(args, "dct_expand_codebook", False)
         self._dct_basis = None
         self._trajectory_coeffs = None
         self._trajectory_coeffs_scale = None
         self._trajectory_coeffs_rot = None
         self._dct_log_alpha = None
+        self._dct_codebook_pos = None
+        self._dct_codebook_scale = None
+        self._dct_codebook_rot = None
+        self._dct_codebook_indices_pos = None
+        self._dct_codebook_indices_scale = None
+        self._dct_codebook_indices_rot = None
+        self._dct_codebook_residual_pos = None
+        self._dct_codebook_residual_scale = None
+        self._dct_codebook_residual_rot = None
 
         self._deformation_table = torch.empty(0)
         self._features_dc = torch.empty(0)
@@ -220,6 +236,18 @@ class GaussianModel:
                 l.append({'params': [self._trajectory_coeffs_rot], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_coeffs_rot"})
             if self.dct_use_gate and self._dct_log_alpha is not None:
                 l.append({'params': [self._dct_log_alpha], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_gate"})
+        if self.use_dct_deform and self.dct_use_codebook_pos and self._dct_codebook_pos is not None:
+            l.append({'params': [self._dct_codebook_pos], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_codebook_pos"})
+            if self._dct_codebook_residual_pos is not None:
+                l.append({'params': [self._dct_codebook_residual_pos], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_residual_pos"})
+        if self.use_dct_deform and self.dct_use_codebook_scale and self._dct_codebook_scale is not None:
+            l.append({'params': [self._dct_codebook_scale], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_codebook_scale"})
+            if self._dct_codebook_residual_scale is not None:
+                l.append({'params': [self._dct_codebook_residual_scale], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_residual_scale"})
+        if self.use_dct_deform and self.dct_use_codebook_rot and self._dct_codebook_rot is not None:
+            l.append({'params': [self._dct_codebook_rot], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_codebook_rot"})
+            if self._dct_codebook_residual_rot is not None:
+                l.append({'params': [self._dct_codebook_residual_rot], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_residual_rot"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         
@@ -255,6 +283,9 @@ class GaussianModel:
                 lr = self.deformation_scheduler_args(iteration)
                 param_group['lr'] = lr
             elif param_group["name"] in ("dct_coeffs_scale", "dct_coeffs_rot"):
+                lr = self.deformation_scheduler_args(iteration)
+                param_group['lr'] = lr
+            elif param_group["name"] in ("dct_codebook_pos", "dct_residual_pos", "dct_codebook_scale", "dct_residual_scale", "dct_codebook_rot", "dct_residual_rot"):
                 lr = self.deformation_scheduler_args(iteration)
                 param_group['lr'] = lr
 
@@ -312,23 +343,91 @@ class GaussianModel:
                 basis_sel = basis_sel * gate[:, None]
         return basis_sel.transpose(0, 1)  # [N, K]
 
+    def _get_dct_coeffs(self, kind):
+        if kind == "pos":
+            if self.dct_use_codebook_pos and self._dct_codebook_pos is not None and self._dct_codebook_indices_pos is not None:
+                idx = self._dct_codebook_indices_pos.long()
+                code = self._dct_codebook_pos[idx]
+                if self._dct_codebook_residual_pos is not None:
+                    return code + self._dct_codebook_residual_pos
+                return code
+            return self._trajectory_coeffs
+        if kind == "scale":
+            if self.dct_use_codebook_scale and self._dct_codebook_scale is not None and self._dct_codebook_indices_scale is not None:
+                idx = self._dct_codebook_indices_scale.long()
+                code = self._dct_codebook_scale[idx]
+                if self._dct_codebook_residual_scale is not None:
+                    return code + self._dct_codebook_residual_scale
+                return code
+            return self._trajectory_coeffs_scale
+        if kind == "rot":
+            if self.dct_use_codebook_rot and self._dct_codebook_rot is not None and self._dct_codebook_indices_rot is not None:
+                idx = self._dct_codebook_indices_rot.long()
+                code = self._dct_codebook_rot[idx]
+                if self._dct_codebook_residual_rot is not None:
+                    return code + self._dct_codebook_residual_rot
+                return code
+            return self._trajectory_coeffs_rot
+        return None
+
     def dct_displacement(self, time_tensor):
-        if self._trajectory_coeffs is None:
+        coeffs = self._get_dct_coeffs("pos")
+        if coeffs is None:
             return None
         basis_sel = self._select_dct_basis(time_tensor)
-        return torch.einsum("nkd,nk->nd", self._trajectory_coeffs, basis_sel)
+        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
 
     def dct_scale_delta(self, time_tensor):
-        if self._trajectory_coeffs_scale is None:
+        coeffs = self._get_dct_coeffs("scale")
+        if coeffs is None:
             return None
         basis_sel = self._select_dct_basis(time_tensor)
-        return torch.einsum("nkd,nk->nd", self._trajectory_coeffs_scale, basis_sel)
+        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
 
     def dct_rot_delta(self, time_tensor):
-        if self._trajectory_coeffs_rot is None:
+        coeffs = self._get_dct_coeffs("rot")
+        if coeffs is None:
             return None
         basis_sel = self._select_dct_basis(time_tensor)
-        return torch.einsum("nkd,nk->nd", self._trajectory_coeffs_rot, basis_sel)
+        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+
+    def _expand_codebook(self, kind):
+        if kind == "pos":
+            if not (self.dct_use_codebook_pos and self._dct_codebook_pos is not None and self._dct_codebook_indices_pos is not None):
+                return
+            idx = self._dct_codebook_indices_pos.long()
+            coeffs = self._dct_codebook_pos[idx]
+            if self._dct_codebook_residual_pos is not None:
+                coeffs = coeffs + self._dct_codebook_residual_pos
+            self._trajectory_coeffs = nn.Parameter(coeffs.requires_grad_(True))
+            self.dct_use_codebook_pos = False
+            self._dct_codebook_pos = None
+            self._dct_codebook_indices_pos = None
+            self._dct_codebook_residual_pos = None
+        elif kind == "scale":
+            if not (self.dct_use_codebook_scale and self._dct_codebook_scale is not None and self._dct_codebook_indices_scale is not None):
+                return
+            idx = self._dct_codebook_indices_scale.long()
+            coeffs = self._dct_codebook_scale[idx]
+            if self._dct_codebook_residual_scale is not None:
+                coeffs = coeffs + self._dct_codebook_residual_scale
+            self._trajectory_coeffs_scale = nn.Parameter(coeffs.requires_grad_(True))
+            self.dct_use_codebook_scale = False
+            self._dct_codebook_scale = None
+            self._dct_codebook_indices_scale = None
+            self._dct_codebook_residual_scale = None
+        elif kind == "rot":
+            if not (self.dct_use_codebook_rot and self._dct_codebook_rot is not None and self._dct_codebook_indices_rot is not None):
+                return
+            idx = self._dct_codebook_indices_rot.long()
+            coeffs = self._dct_codebook_rot[idx]
+            if self._dct_codebook_residual_rot is not None:
+                coeffs = coeffs + self._dct_codebook_residual_rot
+            self._trajectory_coeffs_rot = nn.Parameter(coeffs.requires_grad_(True))
+            self.dct_use_codebook_rot = False
+            self._dct_codebook_rot = None
+            self._dct_codebook_indices_rot = None
+            self._dct_codebook_residual_rot = None
 
     def load_model(self, path):
         print("loading model from exists{}".format(path))
@@ -352,34 +451,84 @@ class GaussianModel:
             self.use_dct_deform = True
             self.dct_k = int(dct.get("dct_k", self.dct_k))
             self.dct_T = int(dct.get("dct_T", self.dct_T))
-            coeffs = dct.get("coeffs", None)
-            if coeffs is not None:
-                self._trajectory_coeffs = nn.Parameter(coeffs.to("cuda").requires_grad_(True))
+            codebook_pos = dct.get("codebook_pos", None)
+            indices_pos = dct.get("indices_pos", None)
+            residuals_pos = dct.get("residuals_pos", None)
+            if codebook_pos is not None and indices_pos is not None:
+                self.dct_use_codebook_pos = True
+                self._dct_codebook_pos = nn.Parameter(codebook_pos.to("cuda").requires_grad_(True))
+                self._dct_codebook_indices_pos = indices_pos.to("cuda")
+                if residuals_pos is not None:
+                    self._dct_codebook_residual_pos = nn.Parameter(residuals_pos.to("cuda").requires_grad_(True))
+            else:
+                coeffs = dct.get("coeffs", None)
+                if coeffs is not None:
+                    self._trajectory_coeffs = nn.Parameter(coeffs.to("cuda").requires_grad_(True))
             coeffs_scale = dct.get("coeffs_scale", None)
             if coeffs_scale is not None:
                 self._trajectory_coeffs_scale = nn.Parameter(coeffs_scale.to("cuda").requires_grad_(True))
                 self.dct_use_scale = True
+            codebook_scale = dct.get("codebook_scale", None)
+            indices_scale = dct.get("indices_scale", None)
+            residuals_scale = dct.get("residuals_scale", None)
+            if codebook_scale is not None and indices_scale is not None:
+                self.dct_use_codebook_scale = True
+                self.dct_use_scale = True
+                self._dct_codebook_scale = nn.Parameter(codebook_scale.to("cuda").requires_grad_(True))
+                self._dct_codebook_indices_scale = indices_scale.to("cuda")
+                if residuals_scale is not None:
+                    self._dct_codebook_residual_scale = nn.Parameter(residuals_scale.to("cuda").requires_grad_(True))
             coeffs_rot = dct.get("coeffs_rot", None)
             if coeffs_rot is not None:
                 self._trajectory_coeffs_rot = nn.Parameter(coeffs_rot.to("cuda").requires_grad_(True))
                 self.dct_use_rot = True
+            codebook_rot = dct.get("codebook_rot", None)
+            indices_rot = dct.get("indices_rot", None)
+            residuals_rot = dct.get("residuals_rot", None)
+            if codebook_rot is not None and indices_rot is not None:
+                self.dct_use_codebook_rot = True
+                self.dct_use_rot = True
+                self._dct_codebook_rot = nn.Parameter(codebook_rot.to("cuda").requires_grad_(True))
+                self._dct_codebook_indices_rot = indices_rot.to("cuda")
+                if residuals_rot is not None:
+                    self._dct_codebook_residual_rot = nn.Parameter(residuals_rot.to("cuda").requires_grad_(True))
             log_alpha = dct.get("log_alpha", None)
             if log_alpha is not None:
                 self._dct_log_alpha = nn.Parameter(log_alpha.to("cuda").requires_grad_(True))
+            if self.dct_expand_codebook:
+                with torch.no_grad():
+                    self._expand_codebook("pos")
+                    self._expand_codebook("scale")
+                    self._expand_codebook("rot")
 
     def save_deformation(self, path):
         torch.save(self._deformation.state_dict(),os.path.join(path, "deformation.pth"))
         torch.save(self._deformation_table,os.path.join(path, "deformation_table.pth"))
         torch.save(self._deformation_accum,os.path.join(path, "deformation_accum.pth"))
-        if self.use_dct_deform and self._trajectory_coeffs is not None:
+        if self.use_dct_deform:
             dct = {
-                "coeffs": self._trajectory_coeffs.detach().cpu(),
+                "coeffs": self._trajectory_coeffs.detach().cpu() if self._trajectory_coeffs is not None else None,
                 "coeffs_scale": self._trajectory_coeffs_scale.detach().cpu() if self._trajectory_coeffs_scale is not None else None,
                 "coeffs_rot": self._trajectory_coeffs_rot.detach().cpu() if self._trajectory_coeffs_rot is not None else None,
                 "log_alpha": self._dct_log_alpha.detach().cpu() if self._dct_log_alpha is not None else None,
                 "dct_k": self.dct_k,
                 "dct_T": self.dct_T,
             }
+            if self.dct_use_codebook_pos and self._dct_codebook_pos is not None and self._dct_codebook_indices_pos is not None:
+                dct["codebook_pos"] = self._dct_codebook_pos.detach().cpu()
+                dct["indices_pos"] = self._dct_codebook_indices_pos.detach().to(torch.uint8).cpu()
+                dct["residuals_pos"] = self._dct_codebook_residual_pos.detach().to(torch.float16).cpu() if self._dct_codebook_residual_pos is not None else None
+                dct["coeffs"] = None
+            if self.dct_use_codebook_scale and self._dct_codebook_scale is not None and self._dct_codebook_indices_scale is not None:
+                dct["codebook_scale"] = self._dct_codebook_scale.detach().cpu()
+                dct["indices_scale"] = self._dct_codebook_indices_scale.detach().to(torch.uint8).cpu()
+                dct["residuals_scale"] = self._dct_codebook_residual_scale.detach().to(torch.float16).cpu() if self._dct_codebook_residual_scale is not None else None
+                dct["coeffs_scale"] = None
+            if self.dct_use_codebook_rot and self._dct_codebook_rot is not None and self._dct_codebook_indices_rot is not None:
+                dct["codebook_rot"] = self._dct_codebook_rot.detach().cpu()
+                dct["indices_rot"] = self._dct_codebook_indices_rot.detach().to(torch.uint8).cpu()
+                dct["residuals_rot"] = self._dct_codebook_residual_rot.detach().to(torch.float16).cpu() if self._dct_codebook_residual_rot is not None else None
+                dct["coeffs_rot"] = None
             torch.save(dct, os.path.join(path, "dct_coeffs.pth"))
 
     def load_ply(self, path):
@@ -484,6 +633,9 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if len(group["params"]) > 1:
                 continue
+            if group.get("name", "") in ("dct_codebook_pos", "dct_codebook_scale", "dct_codebook_rot"):
+                optimizable_tensors[group["name"]] = group["params"][0]
+                continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -513,6 +665,18 @@ class GaussianModel:
             self._trajectory_coeffs_scale = optimizable_tensors["dct_coeffs_scale"]
         if self.use_dct_deform and "dct_coeffs_rot" in optimizable_tensors:
             self._trajectory_coeffs_rot = optimizable_tensors["dct_coeffs_rot"]
+        if self.dct_use_codebook_pos and "dct_residual_pos" in optimizable_tensors:
+            self._dct_codebook_residual_pos = optimizable_tensors["dct_residual_pos"]
+        if self.dct_use_codebook_scale and "dct_residual_scale" in optimizable_tensors:
+            self._dct_codebook_residual_scale = optimizable_tensors["dct_residual_scale"]
+        if self.dct_use_codebook_rot and "dct_residual_rot" in optimizable_tensors:
+            self._dct_codebook_residual_rot = optimizable_tensors["dct_residual_rot"]
+        if self.dct_use_codebook_pos and self._dct_codebook_indices_pos is not None:
+            self._dct_codebook_indices_pos = self._dct_codebook_indices_pos[valid_points_mask]
+        if self.dct_use_codebook_scale and self._dct_codebook_indices_scale is not None:
+            self._dct_codebook_indices_scale = self._dct_codebook_indices_scale[valid_points_mask]
+        if self.dct_use_codebook_rot and self._dct_codebook_indices_rot is not None:
+            self._dct_codebook_indices_rot = self._dct_codebook_indices_rot[valid_points_mask]
         self._deformation_accum = self._deformation_accum[valid_points_mask]
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self._deformation_table = self._deformation_table[valid_points_mask]
@@ -552,12 +716,23 @@ class GaussianModel:
         # "deformation": new_deformation
        }
         if self.use_dct_deform:
-            new_dct = torch.zeros((new_xyz.shape[0], self.dct_k, 3), device="cuda")
-            d["dct_coeffs"] = new_dct
+            if self.dct_use_codebook_pos:
+                if self._dct_codebook_residual_pos is not None:
+                    d["dct_residual_pos"] = torch.zeros((new_xyz.shape[0], self.dct_k, 3), device="cuda")
+            else:
+                d["dct_coeffs"] = torch.zeros((new_xyz.shape[0], self.dct_k, 3), device="cuda")
             if self.dct_use_scale:
-                d["dct_coeffs_scale"] = torch.zeros((new_xyz.shape[0], self.dct_k, 3), device="cuda")
+                if self.dct_use_codebook_scale:
+                    if self._dct_codebook_residual_scale is not None:
+                        d["dct_residual_scale"] = torch.zeros((new_xyz.shape[0], self.dct_k, 3), device="cuda")
+                else:
+                    d["dct_coeffs_scale"] = torch.zeros((new_xyz.shape[0], self.dct_k, 3), device="cuda")
             if self.dct_use_rot:
-                d["dct_coeffs_rot"] = torch.zeros((new_xyz.shape[0], self.dct_k, 4), device="cuda")
+                if self.dct_use_codebook_rot:
+                    if self._dct_codebook_residual_rot is not None:
+                        d["dct_residual_rot"] = torch.zeros((new_xyz.shape[0], self.dct_k, 4), device="cuda")
+                else:
+                    d["dct_coeffs_rot"] = torch.zeros((new_xyz.shape[0], self.dct_k, 4), device="cuda")
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -572,6 +747,21 @@ class GaussianModel:
             self._trajectory_coeffs_scale = optimizable_tensors["dct_coeffs_scale"]
         if self.use_dct_deform and "dct_coeffs_rot" in optimizable_tensors:
             self._trajectory_coeffs_rot = optimizable_tensors["dct_coeffs_rot"]
+        if self.dct_use_codebook_pos and "dct_residual_pos" in optimizable_tensors:
+            self._dct_codebook_residual_pos = optimizable_tensors["dct_residual_pos"]
+        if self.dct_use_codebook_scale and "dct_residual_scale" in optimizable_tensors:
+            self._dct_codebook_residual_scale = optimizable_tensors["dct_residual_scale"]
+        if self.dct_use_codebook_rot and "dct_residual_rot" in optimizable_tensors:
+            self._dct_codebook_residual_rot = optimizable_tensors["dct_residual_rot"]
+        if self.dct_use_codebook_pos and self._dct_codebook_indices_pos is not None:
+            new_idx = torch.zeros((new_xyz.shape[0],), device="cuda", dtype=self._dct_codebook_indices_pos.dtype)
+            self._dct_codebook_indices_pos = torch.cat([self._dct_codebook_indices_pos, new_idx], dim=0)
+        if self.dct_use_codebook_scale and self._dct_codebook_indices_scale is not None:
+            new_idx = torch.zeros((new_xyz.shape[0],), device="cuda", dtype=self._dct_codebook_indices_scale.dtype)
+            self._dct_codebook_indices_scale = torch.cat([self._dct_codebook_indices_scale, new_idx], dim=0)
+        if self.dct_use_codebook_rot and self._dct_codebook_indices_rot is not None:
+            new_idx = torch.zeros((new_xyz.shape[0],), device="cuda", dtype=self._dct_codebook_indices_rot.dtype)
+            self._dct_codebook_indices_rot = torch.cat([self._dct_codebook_indices_rot, new_idx], dim=0)
         
         self._deformation_table = torch.cat([self._deformation_table,new_deformation_table],-1)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
