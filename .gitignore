@@ -13,3 +13,4 @@ scripts/
 *.sh 
 .ply
 /assets/
+/output1/

@@ -55,17 +55,12 @@ def mb(p: Path) -> float:
     return p.stat().st_size / (1024 * 1024) if p.exists() else 0.0
 
 
-def sum_4files_mb(iter_dir: Path):
+def overall_mb(iter_dir: Path) -> float:
     ply = iter_dir / "point_cloud.ply"
     deform = iter_dir / "deformation.pth"
     accum = iter_dir / "deformation_accum.pth"
     table = iter_dir / "deformation_table.pth"
-    gs_mb = mb(ply)
-    deform_mb = mb(deform)
-    accum_mb = mb(accum)
-    table_mb = mb(table)
-    overall = gs_mb + deform_mb + accum_mb + table_mb
-    return gs_mb, deform_mb, accum_mb, table_mb, overall
+    return mb(ply) + mb(deform) + mb(accum) + mb(table)
 
 
 def parse_metrics_from_log(log_path: Path):
@@ -200,7 +195,7 @@ def main():
         # gaussians & size
         ply = it_dir / "point_cloud.ply"
         gauss = ply_vertex_count(ply)
-        gs_mb, deform_mb, accum_mb, table_mb, overall_mb = sum_4files_mb(it_dir)
+        overall = overall_mb(it_dir)
 
         # fps
         fps = run_bench_fps(
@@ -226,15 +221,11 @@ def main():
             "PSNR*": metrics.get("PSNR_star"),
             "FLIP": metrics.get("FLIP"),
             "RMSE": metrics.get("RMSE"),
-            "GS_MB(point_cloud.ply)": round(gs_mb, 3),
-            "Deform_MB(deformation.pth)": round(deform_mb, 3),
-            "Accum_MB(deformation_accum.pth)": round(accum_mb, 3),
-            "Table_MB(deformation_table.pth)": round(table_mb, 3),
-            "Overall_MB(4files)": round(overall_mb, 3),
+            "Overall_MB": round(overall, 3),
         }
         rows.append(row)
 
-        print(f"[OK] {rel} | it={it} | gauss={gauss} | overall={overall_mb:.2f}MB | fps={fps}")
+        print(f"[OK] {rel} | it={it} | gauss={gauss} | overall={overall:.2f}MB | fps={fps}")
 
     df = pd.DataFrame(rows)
 
@@ -292,8 +283,7 @@ def main():
         "Scene", "Iteration",
         "PSNR", "SSIM", "LPIPS",
         "FPS", "Gaussians",
-        "Overall_MB(4files)", "GS_MB(point_cloud.ply)", "Deform_MB(deformation.pth)",
-        "Accum_MB(deformation_accum.pth)", "Table_MB(deformation_table.pth)",
+        "Overall_MB",
         "PSNR*", "FLIP", "RMSE",
     ]
     df = df[[c for c in col_order if c in df.columns] + [c for c in df.columns if c not in col_order]]
