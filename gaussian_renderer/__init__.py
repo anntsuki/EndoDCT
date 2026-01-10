@@ -80,6 +80,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             means3D_deform = means3D[deformation_point] + disp[deformation_point]
             scales_deform = scales[deformation_point]
             rotations_deform = rotations[deformation_point]
+            if getattr(pc, "dct_use_scale", False):
+                ds = pc.dct_scale_delta(time)
+                if ds is not None:
+                    scales_deform = scales_deform + ds[deformation_point]
+            if getattr(pc, "dct_use_rot", False):
+                dr = pc.dct_rot_delta(time)
+                if dr is not None:
+                    rotations_deform = rotations_deform + dr[deformation_point]
             opacity_deform = opacity[deformation_point]
         else:
             means3D_deform, scales_deform, rotations_deform, opacity_deform = pc._deformation(means3D[deformation_point], scales[deformation_point], 

@@ -53,8 +53,12 @@ class GaussianModel:
         self.dct_T = int(getattr(args, "dct_T", 200))
         self.dct_use_gate = getattr(args, "dct_use_gate", True)
         self.dct_gate_init = float(getattr(args, "dct_gate_init", 0.0))
+        self.dct_use_scale = getattr(args, "dct_use_scale", False)
+        self.dct_use_rot = getattr(args, "dct_use_rot", False)
         self._dct_basis = None
         self._trajectory_coeffs = None
+        self._trajectory_coeffs_scale = None
+        self._trajectory_coeffs_rot = None
         self._dct_log_alpha = None
 
         self._deformation_table = torch.empty(0)
@@ -78,6 +82,8 @@ class GaussianModel:
             self._deformation.state_dict(),
             self._deformation_table,
             self._trajectory_coeffs,
+            self._trajectory_coeffs_scale,
+            self._trajectory_coeffs_rot,
             self._dct_log_alpha,
             # self.grid,
             self._features_dc,
@@ -99,6 +105,8 @@ class GaussianModel:
             self._deformation_table,
             self._deformation,
             self._trajectory_coeffs,
+            self._trajectory_coeffs_scale,
+            self._trajectory_coeffs_rot,
             self._dct_log_alpha,
             # self.grid,
             self._features_dc, 
@@ -175,6 +183,14 @@ class GaussianModel:
             self._trajectory_coeffs = nn.Parameter(
                 torch.zeros((self.get_xyz.shape[0], self.dct_k, 3), device="cuda").requires_grad_(True)
             )
+            if self.dct_use_scale:
+                self._trajectory_coeffs_scale = nn.Parameter(
+                    torch.zeros((self.get_xyz.shape[0], self.dct_k, 3), device="cuda").requires_grad_(True)
+                )
+            if self.dct_use_rot:
+                self._trajectory_coeffs_rot = nn.Parameter(
+                    torch.zeros((self.get_xyz.shape[0], self.dct_k, 4), device="cuda").requires_grad_(True)
+                )
             if self.dct_use_gate:
                 self._dct_log_alpha = nn.Parameter(
                     torch.full((self.dct_k,), self.dct_gate_init, device="cuda", dtype=torch.float32).requires_grad_(True)
@@ -198,6 +214,10 @@ class GaussianModel:
         ]
         if self.use_dct_deform and self._trajectory_coeffs is not None:
             l.append({'params': [self._trajectory_coeffs], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_coeffs"})
+            if self._trajectory_coeffs_scale is not None:
+                l.append({'params': [self._trajectory_coeffs_scale], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_coeffs_scale"})
+            if self._trajectory_coeffs_rot is not None:
+                l.append({'params': [self._trajectory_coeffs_rot], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_coeffs_rot"})
             if self.dct_use_gate and self._dct_log_alpha is not None:
                 l.append({'params': [self._dct_log_alpha], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_gate"})
 
@@ -232,6 +252,9 @@ class GaussianModel:
                 param_group['lr'] = lr
                 # return lr
             elif param_group["name"] in ("dct_coeffs", "dct_gate"):
+                lr = self.deformation_scheduler_args(iteration)
+                param_group['lr'] = lr
+            elif param_group["name"] in ("dct_coeffs_scale", "dct_coeffs_rot"):
                 lr = self.deformation_scheduler_args(iteration)
                 param_group['lr'] = lr
 
@@ -272,11 +295,8 @@ class GaussianModel:
             return None
         return torch.sigmoid(self._dct_log_alpha)
 
-    def dct_displacement(self, time_tensor):
-        if self._trajectory_coeffs is None:
-            return None
-        device = self._trajectory_coeffs.device
-        basis = self._ensure_dct_basis(device)
+    def _select_dct_basis(self, time_tensor):
+        basis = self._ensure_dct_basis(time_tensor.device)
         t = time_tensor.detach().float()
         if t.dim() > 1:
             t = t[:, 0]
@@ -290,9 +310,25 @@ class GaussianModel:
             gate = self.dct_gate()
             if gate is not None:
                 basis_sel = basis_sel * gate[:, None]
-        basis_sel = basis_sel.transpose(0, 1)  # [N, K]
-        disp = torch.einsum("nkd,nk->nd", self._trajectory_coeffs, basis_sel)
-        return disp
+        return basis_sel.transpose(0, 1)  # [N, K]
+
+    def dct_displacement(self, time_tensor):
+        if self._trajectory_coeffs is None:
+            return None
+        basis_sel = self._select_dct_basis(time_tensor)
+        return torch.einsum("nkd,nk->nd", self._trajectory_coeffs, basis_sel)
+
+    def dct_scale_delta(self, time_tensor):
+        if self._trajectory_coeffs_scale is None:
+            return None
+        basis_sel = self._select_dct_basis(time_tensor)
+        return torch.einsum("nkd,nk->nd", self._trajectory_coeffs_scale, basis_sel)
+
+    def dct_rot_delta(self, time_tensor):
+        if self._trajectory_coeffs_rot is None:
+            return None
+        basis_sel = self._select_dct_basis(time_tensor)
+        return torch.einsum("nkd,nk->nd", self._trajectory_coeffs_rot, basis_sel)
 
     def load_model(self, path):
         print("loading model from exists{}".format(path))
@@ -319,6 +355,14 @@ class GaussianModel:
             coeffs = dct.get("coeffs", None)
             if coeffs is not None:
                 self._trajectory_coeffs = nn.Parameter(coeffs.to("cuda").requires_grad_(True))
+            coeffs_scale = dct.get("coeffs_scale", None)
+            if coeffs_scale is not None:
+                self._trajectory_coeffs_scale = nn.Parameter(coeffs_scale.to("cuda").requires_grad_(True))
+                self.dct_use_scale = True
+            coeffs_rot = dct.get("coeffs_rot", None)
+            if coeffs_rot is not None:
+                self._trajectory_coeffs_rot = nn.Parameter(coeffs_rot.to("cuda").requires_grad_(True))
+                self.dct_use_rot = True
             log_alpha = dct.get("log_alpha", None)
             if log_alpha is not None:
                 self._dct_log_alpha = nn.Parameter(log_alpha.to("cuda").requires_grad_(True))
@@ -330,6 +374,8 @@ class GaussianModel:
         if self.use_dct_deform and self._trajectory_coeffs is not None:
             dct = {
                 "coeffs": self._trajectory_coeffs.detach().cpu(),
+                "coeffs_scale": self._trajectory_coeffs_scale.detach().cpu() if self._trajectory_coeffs_scale is not None else None,
+                "coeffs_rot": self._trajectory_coeffs_rot.detach().cpu() if self._trajectory_coeffs_rot is not None else None,
                 "log_alpha": self._dct_log_alpha.detach().cpu() if self._dct_log_alpha is not None else None,
                 "dct_k": self.dct_k,
                 "dct_T": self.dct_T,
@@ -381,6 +427,14 @@ class GaussianModel:
             self._trajectory_coeffs = nn.Parameter(
                 torch.zeros((self.get_xyz.shape[0], self.dct_k, 3), device="cuda").requires_grad_(True)
             )
+            if self.dct_use_scale and self._trajectory_coeffs_scale is None:
+                self._trajectory_coeffs_scale = nn.Parameter(
+                    torch.zeros((self.get_xyz.shape[0], self.dct_k, 3), device="cuda").requires_grad_(True)
+                )
+            if self.dct_use_rot and self._trajectory_coeffs_rot is None:
+                self._trajectory_coeffs_rot = nn.Parameter(
+                    torch.zeros((self.get_xyz.shape[0], self.dct_k, 4), device="cuda").requires_grad_(True)
+                )
             if self.dct_use_gate and self._dct_log_alpha is None:
                 self._dct_log_alpha = nn.Parameter(
                     torch.full((self.dct_k,), self.dct_gate_init, device="cuda", dtype=torch.float32).requires_grad_(True)
@@ -455,6 +509,10 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         if self.use_dct_deform and "dct_coeffs" in optimizable_tensors:
             self._trajectory_coeffs = optimizable_tensors["dct_coeffs"]
+        if self.use_dct_deform and "dct_coeffs_scale" in optimizable_tensors:
+            self._trajectory_coeffs_scale = optimizable_tensors["dct_coeffs_scale"]
+        if self.use_dct_deform and "dct_coeffs_rot" in optimizable_tensors:
+            self._trajectory_coeffs_rot = optimizable_tensors["dct_coeffs_rot"]
         self._deformation_accum = self._deformation_accum[valid_points_mask]
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self._deformation_table = self._deformation_table[valid_points_mask]
@@ -496,6 +554,10 @@ class GaussianModel:
         if self.use_dct_deform:
             new_dct = torch.zeros((new_xyz.shape[0], self.dct_k, 3), device="cuda")
             d["dct_coeffs"] = new_dct
+            if self.dct_use_scale:
+                d["dct_coeffs_scale"] = torch.zeros((new_xyz.shape[0], self.dct_k, 3), device="cuda")
+            if self.dct_use_rot:
+                d["dct_coeffs_rot"] = torch.zeros((new_xyz.shape[0], self.dct_k, 4), device="cuda")
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -506,6 +568,10 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         if self.use_dct_deform and "dct_coeffs" in optimizable_tensors:
             self._trajectory_coeffs = optimizable_tensors["dct_coeffs"]
+        if self.use_dct_deform and "dct_coeffs_scale" in optimizable_tensors:
+            self._trajectory_coeffs_scale = optimizable_tensors["dct_coeffs_scale"]
+        if self.use_dct_deform and "dct_coeffs_rot" in optimizable_tensors:
+            self._trajectory_coeffs_rot = optimizable_tensors["dct_coeffs_rot"]
         
         self._deformation_table = torch.cat([self._deformation_table,new_deformation_table],-1)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")

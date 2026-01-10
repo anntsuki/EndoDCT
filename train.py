@@ -318,6 +318,14 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
         student_gaussians._trajectory_coeffs = torch.nn.Parameter(
             torch.zeros((student_gaussians.get_xyz.shape[0], student_gaussians.dct_k, 3), device="cuda").requires_grad_(True)
         )
+    if student_gaussians.dct_use_scale and student_gaussians._trajectory_coeffs_scale is None:
+        student_gaussians._trajectory_coeffs_scale = torch.nn.Parameter(
+            torch.zeros((student_gaussians.get_xyz.shape[0], student_gaussians.dct_k, 3), device="cuda").requires_grad_(True)
+        )
+    if student_gaussians.dct_use_rot and student_gaussians._trajectory_coeffs_rot is None:
+        student_gaussians._trajectory_coeffs_rot = torch.nn.Parameter(
+            torch.zeros((student_gaussians.get_xyz.shape[0], student_gaussians.dct_k, 4), device="cuda").requires_grad_(True)
+        )
     if student_gaussians.dct_use_gate and student_gaussians._dct_log_alpha is None:
         student_gaussians._dct_log_alpha = torch.nn.Parameter(
             torch.full((student_gaussians.dct_k,), student_gaussians.dct_gate_init, device="cuda", dtype=torch.float32).requires_grad_(True)
@@ -333,6 +341,10 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     params = [student_gaussians._trajectory_coeffs]
     if student_gaussians.dct_use_gate and student_gaussians._dct_log_alpha is not None:
         params.append(student_gaussians._dct_log_alpha)
+    if student_gaussians._trajectory_coeffs_scale is not None:
+        params.append(student_gaussians._trajectory_coeffs_scale)
+    if student_gaussians._trajectory_coeffs_rot is not None:
+        params.append(student_gaussians._trajectory_coeffs_rot)
     if args.dct_xyz_lr_mult > 0:
         student_gaussians._xyz.requires_grad_(True)
         params.append(student_gaussians._xyz)
@@ -347,6 +359,8 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     lr_map = {
         id(student_gaussians._trajectory_coeffs): base_lr * args.dct_lr_mult,
         id(student_gaussians._dct_log_alpha): base_lr * args.dct_lr_mult,
+        id(student_gaussians._trajectory_coeffs_scale): base_lr * args.dct_lr_mult,
+        id(student_gaussians._trajectory_coeffs_rot): base_lr * args.dct_lr_mult,
         id(student_gaussians._xyz): opt.position_lr_init * args.dct_xyz_lr_mult,
         id(student_gaussians._features_dc): opt.feature_lr * args.distill_unfreeze_lr_mult,
         id(student_gaussians._features_rest): (opt.feature_lr / 20.0) * args.distill_unfreeze_lr_mult,

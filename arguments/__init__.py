@@ -107,6 +107,8 @@ class ModelHiddenParams(ParamGroup):
         self.dct_T = 200
         self.dct_use_gate = True
         self.dct_gate_init = 0.0
+        self.dct_use_scale = False
+        self.dct_use_rot = False
         super().__init__(parser, "ModelHiddenParams")
         
 class OptimizationParams(ParamGroup):
