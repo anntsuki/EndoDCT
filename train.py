@@ -333,15 +333,41 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     params = [student_gaussians._trajectory_coeffs]
     if student_gaussians.dct_use_gate and student_gaussians._dct_log_alpha is not None:
         params.append(student_gaussians._dct_log_alpha)
+    if args.dct_xyz_lr_mult > 0:
+        student_gaussians._xyz.requires_grad_(True)
+        params.append(student_gaussians._xyz)
+    if args.distill_unfreeze_all:
+        for p in [student_gaussians._features_dc, student_gaussians._features_rest,
+                  student_gaussians._opacity, student_gaussians._scaling, student_gaussians._rotation]:
+            p.requires_grad_(True)
+            params.append(p)
     if student_gaussians.spatial_lr_scale == 0:
         student_gaussians.spatial_lr_scale = 1.0
-    optimizer = torch.optim.Adam(params, lr=opt.deformation_lr_init * student_gaussians.spatial_lr_scale, eps=1e-15)
+    base_lr = opt.deformation_lr_init * student_gaussians.spatial_lr_scale
+    lr_map = {
+        id(student_gaussians._trajectory_coeffs): base_lr * args.dct_lr_mult,
+        id(student_gaussians._dct_log_alpha): base_lr * args.dct_lr_mult,
+        id(student_gaussians._xyz): opt.position_lr_init * args.dct_xyz_lr_mult,
+        id(student_gaussians._features_dc): opt.feature_lr * args.distill_unfreeze_lr_mult,
+        id(student_gaussians._features_rest): (opt.feature_lr / 20.0) * args.distill_unfreeze_lr_mult,
+        id(student_gaussians._opacity): opt.opacity_lr * args.distill_unfreeze_lr_mult,
+        id(student_gaussians._scaling): opt.scaling_lr * args.distill_unfreeze_lr_mult,
+        id(student_gaussians._rotation): opt.rotation_lr * args.distill_unfreeze_lr_mult,
+    }
+    param_groups = []
+    for p in params:
+        lr = lr_map.get(id(p), base_lr)
+        param_groups.append({"params": [p], "lr": lr})
+    optimizer = torch.optim.Adam(param_groups, eps=1e-15)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     viewpoint_stack = teacher_scene.getTrainCameras()
 
     ema_loss_for_log = 0.0
+    lr_decay_steps = set(args.dct_lr_decay_iters)
+    if not lr_decay_steps:
+        lr_decay_steps = {int(args.distill_iterations * 0.6), int(args.distill_iterations * 0.8)}
     progress_bar = tqdm(range(1, args.distill_iterations + 1), desc="Distill DCT")
     for iteration in range(1, args.distill_iterations + 1):
         idx = randint(0, len(viewpoint_stack)-1)
@@ -355,7 +381,15 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
         student_img = student_pkg["render"]
         mask = viewpoint_cam.mask.cuda().float()
 
-        loss = l1_loss(student_img.unsqueeze(0), teacher_img.unsqueeze(0), mask.unsqueeze(0))
+        ssim_w = max(0.0, min(1.0, args.distill_ssim_weight))
+        l1_w = 1.0 - ssim_w
+        l1 = l1_loss(student_img.unsqueeze(0), teacher_img.unsqueeze(0), mask.unsqueeze(0))
+        if ssim_w > 0:
+            mask3 = mask
+            ssim_val = ssim((student_img * mask3).unsqueeze(0), (teacher_img * mask3).unsqueeze(0))
+            loss = l1_w * l1 + ssim_w * (1.0 - ssim_val)
+        else:
+            loss = l1
         if student_gaussians.dct_use_gate and args.dct_gate_lambda > 0 and student_gaussians._dct_log_alpha is not None:
             loss = loss + args.dct_gate_lambda * torch.sigmoid(student_gaussians._dct_log_alpha).sum()
 
@@ -369,6 +403,10 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
             progress_bar.update(10)
         if iteration == args.distill_iterations:
             progress_bar.close()
+
+        if iteration in lr_decay_steps:
+            for group in optimizer.param_groups:
+                group["lr"] *= args.dct_lr_decay_gamma
 
         if iteration in saving_iterations:
             print(f"\n[ITER {iteration}] Saving DCT Gaussians")
@@ -469,6 +507,13 @@ if __name__ == "__main__":
     parser.add_argument("--distill_iteration", type=int, default=-1)
     parser.add_argument("--distill_iterations", type=int, default=2000)
     parser.add_argument("--dct_gate_lambda", type=float, default=0.0)
+    parser.add_argument("--dct_lr_mult", type=float, default=10.0)
+    parser.add_argument("--dct_xyz_lr_mult", type=float, default=0.0)
+    parser.add_argument("--distill_ssim_weight", type=float, default=0.2)
+    parser.add_argument("--dct_lr_decay_iters", nargs="+", type=int, default=[])
+    parser.add_argument("--dct_lr_decay_gamma", type=float, default=0.3)
+    parser.add_argument("--distill_unfreeze_all", action="store_true", default=False)
+    parser.add_argument("--distill_unfreeze_lr_mult", type=float, default=0.01)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     if args.configs:

@@ -280,6 +280,9 @@ class GaussianModel:
         t = time_tensor.detach().float()
         if t.dim() > 1:
             t = t[:, 0]
+        if t.numel() > 0 and float(t.max()) > 1.0:
+            denom = max(1.0, float(self.dct_T - 1))
+            t = t / denom
         t = torch.clamp(t, 0.0, 1.0)
         idx = torch.round(t * (basis.shape[1] - 1)).long().clamp(0, basis.shape[1] - 1)
         basis_sel = basis[:, idx]  # [K, N]
