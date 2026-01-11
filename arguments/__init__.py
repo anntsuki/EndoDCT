@@ -116,6 +116,7 @@ class ModelHiddenParams(ParamGroup):
         self.dct_codebook_size_scale = 256
         self.dct_codebook_size_rot = 256
         self.dct_expand_codebook = False
+        self.fp16_static = False
         super().__init__(parser, "ModelHiddenParams")
         
 class OptimizationParams(ParamGroup):

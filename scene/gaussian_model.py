@@ -62,6 +62,7 @@ class GaussianModel:
         self.dct_codebook_size_scale = int(getattr(args, "dct_codebook_size_scale", 256))
         self.dct_codebook_size_rot = int(getattr(args, "dct_codebook_size_rot", 256))
         self.dct_expand_codebook = getattr(args, "dct_expand_codebook", False)
+        self.fp16_static = getattr(args, "fp16_static", False)
         self._dct_basis = None
         self._trajectory_coeffs = None
         self._trajectory_coeffs_scale = None
@@ -211,6 +212,19 @@ class GaussianModel:
                 self._dct_log_alpha = nn.Parameter(
                     torch.full((self.dct_k,), self.dct_gate_init, device="cuda", dtype=torch.float32).requires_grad_(True)
                 )
+        self._apply_fp16_static()
+
+    def _apply_fp16_static(self):
+        if not self.fp16_static:
+            return
+        for name in ("_xyz", "_opacity", "_rotation"):
+            t = getattr(self, name, None)
+            if t is None or not torch.is_tensor(t):
+                continue
+            if isinstance(t, nn.Parameter):
+                setattr(self, name, nn.Parameter(t.data.half(), requires_grad=t.requires_grad))
+            else:
+                setattr(self, name, t.half())
     
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -446,20 +460,35 @@ class GaussianModel:
         
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         dct_path = os.path.join(path, "dct_coeffs.pth")
-        if os.path.exists(dct_path):
+        if not os.path.exists(dct_path):
+            xz_path = dct_path + ".xz"
+            if os.path.exists(xz_path):
+                import lzma
+                import pickle
+                data = lzma.decompress(open(xz_path, "rb").read())
+                dct = pickle.loads(data)
+            else:
+                dct = None
+        else:
             dct = torch.load(dct_path, map_location="cuda")
+        if dct is not None:
             self.use_dct_deform = True
             self.dct_k = int(dct.get("dct_k", self.dct_k))
             self.dct_T = int(dct.get("dct_T", self.dct_T))
             codebook_pos = dct.get("codebook_pos", None)
             indices_pos = dct.get("indices_pos", None)
             residuals_pos = dct.get("residuals_pos", None)
+            residuals_pos_int8 = dct.get("residuals_pos_int8", None)
+            residuals_pos_scale = dct.get("residuals_pos_scale", None)
             if codebook_pos is not None and indices_pos is not None:
                 self.dct_use_codebook_pos = True
-                self._dct_codebook_pos = nn.Parameter(codebook_pos.to("cuda").requires_grad_(True))
+                self._dct_codebook_pos = nn.Parameter(codebook_pos.to("cuda").float().requires_grad_(True))
                 self._dct_codebook_indices_pos = indices_pos.to("cuda")
-                if residuals_pos is not None:
-                    self._dct_codebook_residual_pos = nn.Parameter(residuals_pos.to("cuda").requires_grad_(True))
+                if residuals_pos_int8 is not None and residuals_pos_scale is not None:
+                    res = residuals_pos_int8.to("cuda").float() * float(residuals_pos_scale)
+                    self._dct_codebook_residual_pos = nn.Parameter(res.requires_grad_(True))
+                elif residuals_pos is not None:
+                    self._dct_codebook_residual_pos = nn.Parameter(residuals_pos.to("cuda").float().requires_grad_(True))
             else:
                 coeffs = dct.get("coeffs", None)
                 if coeffs is not None:
@@ -471,13 +500,18 @@ class GaussianModel:
             codebook_scale = dct.get("codebook_scale", None)
             indices_scale = dct.get("indices_scale", None)
             residuals_scale = dct.get("residuals_scale", None)
+            residuals_scale_int8 = dct.get("residuals_scale_int8", None)
+            residuals_scale_scale = dct.get("residuals_scale_scale", None)
             if codebook_scale is not None and indices_scale is not None:
                 self.dct_use_codebook_scale = True
                 self.dct_use_scale = True
-                self._dct_codebook_scale = nn.Parameter(codebook_scale.to("cuda").requires_grad_(True))
+                self._dct_codebook_scale = nn.Parameter(codebook_scale.to("cuda").float().requires_grad_(True))
                 self._dct_codebook_indices_scale = indices_scale.to("cuda")
-                if residuals_scale is not None:
-                    self._dct_codebook_residual_scale = nn.Parameter(residuals_scale.to("cuda").requires_grad_(True))
+                if residuals_scale_int8 is not None and residuals_scale_scale is not None:
+                    res = residuals_scale_int8.to("cuda").float() * float(residuals_scale_scale)
+                    self._dct_codebook_residual_scale = nn.Parameter(res.requires_grad_(True))
+                elif residuals_scale is not None:
+                    self._dct_codebook_residual_scale = nn.Parameter(residuals_scale.to("cuda").float().requires_grad_(True))
             coeffs_rot = dct.get("coeffs_rot", None)
             if coeffs_rot is not None:
                 self._trajectory_coeffs_rot = nn.Parameter(coeffs_rot.to("cuda").requires_grad_(True))
@@ -485,13 +519,18 @@ class GaussianModel:
             codebook_rot = dct.get("codebook_rot", None)
             indices_rot = dct.get("indices_rot", None)
             residuals_rot = dct.get("residuals_rot", None)
+            residuals_rot_int8 = dct.get("residuals_rot_int8", None)
+            residuals_rot_scale = dct.get("residuals_rot_scale", None)
             if codebook_rot is not None and indices_rot is not None:
                 self.dct_use_codebook_rot = True
                 self.dct_use_rot = True
-                self._dct_codebook_rot = nn.Parameter(codebook_rot.to("cuda").requires_grad_(True))
+                self._dct_codebook_rot = nn.Parameter(codebook_rot.to("cuda").float().requires_grad_(True))
                 self._dct_codebook_indices_rot = indices_rot.to("cuda")
-                if residuals_rot is not None:
-                    self._dct_codebook_residual_rot = nn.Parameter(residuals_rot.to("cuda").requires_grad_(True))
+                if residuals_rot_int8 is not None and residuals_rot_scale is not None:
+                    res = residuals_rot_int8.to("cuda").float() * float(residuals_rot_scale)
+                    self._dct_codebook_residual_rot = nn.Parameter(res.requires_grad_(True))
+                elif residuals_rot is not None:
+                    self._dct_codebook_residual_rot = nn.Parameter(residuals_rot.to("cuda").float().requires_grad_(True))
             log_alpha = dct.get("log_alpha", None)
             if log_alpha is not None:
                 self._dct_log_alpha = nn.Parameter(log_alpha.to("cuda").requires_grad_(True))
@@ -571,6 +610,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._apply_fp16_static()
         self.active_sh_degree = self.max_sh_degree
         if self.use_dct_deform and self._trajectory_coeffs is None:
             self._trajectory_coeffs = nn.Parameter(

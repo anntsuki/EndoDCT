@@ -101,6 +101,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rotations_final = torch.zeros_like(rotations)
     scales_final = torch.zeros_like(scales)
     opacity_final = torch.zeros_like(opacity)
+    if means3D_deform is not None:
+        means3D_deform = means3D_deform.to(means3D_final.dtype)
+    if rotations_deform is not None:
+        rotations_deform = rotations_deform.to(rotations_final.dtype)
+    if scales_deform is not None:
+        scales_deform = scales_deform.to(scales_final.dtype)
+    if opacity_deform is not None:
+        opacity_deform = opacity_deform.to(opacity_final.dtype)
     means3D_final[deformation_point] =  means3D_deform
     rotations_final[deformation_point] =  rotations_deform
     scales_final[deformation_point] =  scales_deform
@@ -131,6 +139,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    # Rasterizer expects float32 inputs; ensure fp16_static does not break dtype.
+    def _fp32(x):
+        return x.float() if torch.is_tensor(x) and x.dtype != torch.float32 else x
+
+    means3D_final = _fp32(means3D_final)
+    scales_final = _fp32(scales_final)
+    rotations_final = _fp32(rotations_final)
+    opacity = _fp32(opacity)
+    cov3D_precomp = _fp32(cov3D_precomp)
+    shs = _fp32(shs)
+    colors_precomp = _fp32(colors_precomp)
+
     rendered_image, radii, depth = rasterizer(
         means3D = means3D_final,
         means2D = means2D,
