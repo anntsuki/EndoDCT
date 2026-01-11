@@ -350,7 +350,10 @@ class GaussianModel:
             t = t / denom
         t = torch.clamp(t, 0.0, 1.0)
         idx = torch.round(t * (basis.shape[1] - 1)).long().clamp(0, basis.shape[1] - 1)
-        basis_sel = basis[:, idx]  # [K, N]
+        if idx.dim() == 0 or idx.numel() == 1:
+            basis_sel = basis[:, idx].unsqueeze(1)  # [K, 1]
+        else:
+            basis_sel = basis[:, idx]  # [K, N]
         if self.dct_use_gate:
             gate = self.dct_gate()
             if gate is not None:
@@ -389,6 +392,8 @@ class GaussianModel:
         if coeffs is None:
             return None
         basis_sel = self._select_dct_basis(time_tensor)
+        if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
+            basis_sel = basis_sel.expand(coeffs.shape[0], -1)
         return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
 
     def dct_scale_delta(self, time_tensor):
@@ -396,6 +401,8 @@ class GaussianModel:
         if coeffs is None:
             return None
         basis_sel = self._select_dct_basis(time_tensor)
+        if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
+            basis_sel = basis_sel.expand(coeffs.shape[0], -1)
         return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
 
     def dct_rot_delta(self, time_tensor):
@@ -403,6 +410,8 @@ class GaussianModel:
         if coeffs is None:
             return None
         basis_sel = self._select_dct_basis(time_tensor)
+        if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
+            basis_sel = basis_sel.expand(coeffs.shape[0], -1)
         return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
 
     def _expand_codebook(self, kind):

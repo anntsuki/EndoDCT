@@ -75,7 +75,18 @@ def run_cmd(cmd, cwd: Path):
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
-def run_bench_fps(repo_root: Path, exp: Path, iteration: int, split="test", views=1, warmup=10, iters=200, python_exe: Optional[str] = None):
+def run_bench_fps(
+    repo_root: Path,
+    exp: Path,
+    iteration: int,
+    split="test",
+    views=1,
+    warmup=100,
+    iters=200,
+    python_exe: Optional[str] = None,
+    dct_expand_codebook: bool = False,
+    fp16_static: bool = False,
+):
     python_cmd = python_exe or "python"
     cmd = [
         python_cmd, str(repo_root / "bench_fps.py"),
@@ -87,6 +98,10 @@ def run_bench_fps(repo_root: Path, exp: Path, iteration: int, split="test", view
         "--iters", str(iters),
         "--json",
     ]
+    if dct_expand_codebook:
+        cmd.append("--dct_expand_codebook")
+    if fp16_static:
+        cmd.append("--fp16_static")
     out = subprocess.check_output(cmd, cwd=str(repo_root), text=True, encoding="utf-8", errors="ignore")
     for line in reversed(out.splitlines()):
         line = line.strip()
@@ -111,6 +126,10 @@ def main():
     ap.add_argument("--fps_only", action="store_true", default=False, help="Only recompute FPS and update Excel")
     ap.add_argument("--dct_use_scale", action="store_true", default=False, help="Enable DCT scaling deformation")
     ap.add_argument("--dct_use_rot", action="store_true", default=False, help="Enable DCT rotation deformation")
+    ap.add_argument("--bench_warmup", type=int, default=10)
+    ap.add_argument("--bench_iters", type=int, default=200)
+    ap.add_argument("--dct_expand_codebook", action="store_true", default=False)
+    ap.add_argument("--fp16_static", action="store_true", default=False)
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
@@ -223,7 +242,16 @@ def main():
         ply = iter_dir / "point_cloud.ply"
         gauss = ply_vertex_count(ply)
         overall = overall_mb(iter_dir)
-        fps = run_bench_fps(repo_root, out_dir, args.distill_iterations, python_exe=args.python_exe)
+        fps = run_bench_fps(
+            repo_root,
+            out_dir,
+            args.distill_iterations,
+            warmup=args.bench_warmup,
+            iters=args.bench_iters,
+            python_exe=args.python_exe,
+            dct_expand_codebook=args.dct_expand_codebook,
+            fp16_static=args.fp16_static,
+        )
 
         rows.append({
             "Dataset": s["dataset"],
@@ -249,10 +277,17 @@ def main():
     summary = df.groupby("Dataset", as_index=False)[numeric_cols].mean(numeric_only=True)
 
     out_xlsx = output_root / args.out_xlsx
-    with pd.ExcelWriter(out_xlsx) as writer:
-        df.to_excel(writer, index=False, sheet_name="All")
-        summary.to_excel(writer, index=False, sheet_name="DatasetSummary")
-    print(f"\nSaved: {out_xlsx}")
+    try:
+        with pd.ExcelWriter(out_xlsx) as writer:
+            df.to_excel(writer, index=False, sheet_name="All")
+            summary.to_excel(writer, index=False, sheet_name="DatasetSummary")
+        print(f"\nSaved: {out_xlsx}")
+    except PermissionError:
+        alt = out_xlsx.with_name(out_xlsx.stem + "1" + out_xlsx.suffix)
+        with pd.ExcelWriter(alt) as writer:
+            df.to_excel(writer, index=False, sheet_name="All")
+            summary.to_excel(writer, index=False, sheet_name="DatasetSummary")
+        print(f"\nSaved: {alt}")
 
 
 if __name__ == "__main__":
