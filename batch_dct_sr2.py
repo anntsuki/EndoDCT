@@ -86,6 +86,7 @@ def run_bench_fps(
     python_exe: Optional[str] = None,
     dct_expand_codebook: bool = False,
     fp16_static: bool = False,
+    dct_masked: bool = False,
 ):
     python_cmd = python_exe or "python"
     cmd = [
@@ -102,6 +103,8 @@ def run_bench_fps(
         cmd.append("--dct_expand_codebook")
     if fp16_static:
         cmd.append("--fp16_static")
+    if dct_masked:
+        cmd.append("--dct_masked")
     out = subprocess.check_output(cmd, cwd=str(repo_root), text=True, encoding="utf-8", errors="ignore")
     for line in reversed(out.splitlines()):
         line = line.strip()
@@ -121,15 +124,18 @@ def main():
     ap.add_argument("--dct_xyz_lr_mult", type=float, default=0.01)
     ap.add_argument("--distill_ssim_weight", type=float, default=0.1)
     ap.add_argument("--distill_unfreeze_lr_mult", type=float, default=0.01)
+    ap.add_argument("--distill_unfreeze_all", action="store_true", default=False)
     ap.add_argument("--out_xlsx", default="endo_all_metrics_dct_sr2.xlsx")
     ap.add_argument("--python", dest="python_exe", default="python", help="Python executable for running train/render/metrics")
     ap.add_argument("--fps_only", action="store_true", default=False, help="Only recompute FPS and update Excel")
+    ap.add_argument("--skip_train", action="store_true", default=False, help="Skip distill training and only render/metrics/FPS")
     ap.add_argument("--dct_use_scale", action="store_true", default=False, help="Enable DCT scaling deformation")
     ap.add_argument("--dct_use_rot", action="store_true", default=False, help="Enable DCT rotation deformation")
     ap.add_argument("--bench_warmup", type=int, default=10)
     ap.add_argument("--bench_iters", type=int, default=200)
     ap.add_argument("--dct_expand_codebook", action="store_true", default=False)
     ap.add_argument("--fp16_static", action="store_true", default=False)
+    ap.add_argument("--dct_masked", action="store_true", default=False)
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
@@ -172,6 +178,13 @@ def main():
             "teacher": repo_root / "output" / "scared" / "dataset_1" / "keyframe_3",
             "config": repo_root / "arguments" / "scared" / "d3k1.py",
         },
+        {
+            "dataset": "Hamlyn",
+            "scene": "hamlyn_seq1",
+            "data_path": repo_root / "assets" / "data" / "hamlyn_forplane" / "hamlyn_seq1",
+            "teacher": repo_root / "output" / "hamlyn" / "hamlyn_seq1",
+            "config": repo_root / "arguments" / "hamlyn" / "seq1.py",
+        },
     ]
 
     rows = []
@@ -188,30 +201,31 @@ def main():
         out_dir.parent.mkdir(parents=True, exist_ok=True)
 
         if not args.fps_only:
-            train_cmd = [
-                args.python_exe, str(repo_root / "train.py"),
-                "--configs", str(s["config"]),
-                "--model_path", str(out_dir),
-                "--distill_dct",
-                "--teacher_model_path", str(s["teacher"]),
-                "--distill_iteration", "-1",
-                "--distill_iterations", str(args.distill_iterations),
-                "--use_dct_deform",
-            ]
-            if args.dct_use_scale:
-                train_cmd.append("--dct_use_scale")
-            if args.dct_use_rot:
-                train_cmd.append("--dct_use_rot")
-            train_cmd += [
-                "--dct_k", str(args.dct_k),
-                "--dct_T", str(t),
-                "--dct_lr_mult", str(args.dct_lr_mult),
-                "--dct_xyz_lr_mult", str(args.dct_xyz_lr_mult),
-                "--distill_ssim_weight", str(args.distill_ssim_weight),
-                "--distill_unfreeze_all",
-                "--distill_unfreeze_lr_mult", str(args.distill_unfreeze_lr_mult),
-            ]
-            run_cmd(train_cmd, repo_root)
+            if not args.skip_train:
+                train_cmd = [
+                    args.python_exe, str(repo_root / "train.py"),
+                    "--configs", str(s["config"]),
+                    "--model_path", str(out_dir),
+                    "--distill_dct",
+                    "--teacher_model_path", str(s["teacher"]),
+                    "--distill_iteration", "-1",
+                    "--distill_iterations", str(args.distill_iterations),
+                    "--use_dct_deform",
+                ]
+                if args.dct_use_scale:
+                    train_cmd.append("--dct_use_scale")
+                if args.dct_use_rot:
+                    train_cmd.append("--dct_use_rot")
+                train_cmd += [
+                    "--dct_k", str(args.dct_k),
+                    "--dct_T", str(t),
+                    "--dct_lr_mult", str(args.dct_lr_mult),
+                    "--dct_xyz_lr_mult", str(args.dct_xyz_lr_mult),
+                    "--distill_ssim_weight", str(args.distill_ssim_weight),
+                    "--distill_unfreeze_all",
+                    "--distill_unfreeze_lr_mult", str(args.distill_unfreeze_lr_mult),
+                ]
+                run_cmd(train_cmd, repo_root)
 
             render_cmd = [
                 args.python_exe, str(repo_root / "render.py"),
@@ -226,6 +240,8 @@ def main():
                 render_cmd.append("--dct_use_scale")
             if args.dct_use_rot:
                 render_cmd.append("--dct_use_rot")
+            if args.dct_masked:
+                render_cmd.append("--dct_masked")
             run_cmd(render_cmd, repo_root)
 
             metrics_cmd = [
@@ -251,6 +267,7 @@ def main():
             python_exe=args.python_exe,
             dct_expand_codebook=args.dct_expand_codebook,
             fp16_static=args.fp16_static,
+            dct_masked=args.dct_masked,
         )
 
         rows.append({

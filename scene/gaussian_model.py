@@ -63,6 +63,7 @@ class GaussianModel:
         self.dct_codebook_size_rot = int(getattr(args, "dct_codebook_size_rot", 256))
         self.dct_expand_codebook = getattr(args, "dct_expand_codebook", False)
         self.fp16_static = getattr(args, "fp16_static", False)
+        self.dct_masked = getattr(args, "dct_masked", False)
         self._dct_basis = None
         self._trajectory_coeffs = None
         self._trajectory_coeffs_scale = None
@@ -387,8 +388,46 @@ class GaussianModel:
             return self._trajectory_coeffs_rot
         return None
 
+    def _get_dct_coeffs_for_indices(self, kind, idx):
+        if idx is None or idx.numel() == 0:
+            return None
+        if kind == "pos":
+            if self.dct_use_codebook_pos and self._dct_codebook_pos is not None and self._dct_codebook_indices_pos is not None:
+                cb_idx = self._dct_codebook_indices_pos[idx].long()
+                code = self._dct_codebook_pos[cb_idx]
+                if self._dct_codebook_residual_pos is not None:
+                    return code + self._dct_codebook_residual_pos[idx]
+                return code
+            return self._trajectory_coeffs[idx] if self._trajectory_coeffs is not None else None
+        if kind == "scale":
+            if self.dct_use_codebook_scale and self._dct_codebook_scale is not None and self._dct_codebook_indices_scale is not None:
+                cb_idx = self._dct_codebook_indices_scale[idx].long()
+                code = self._dct_codebook_scale[cb_idx]
+                if self._dct_codebook_residual_scale is not None:
+                    return code + self._dct_codebook_residual_scale[idx]
+                return code
+            return self._trajectory_coeffs_scale[idx] if self._trajectory_coeffs_scale is not None else None
+        if kind == "rot":
+            if self.dct_use_codebook_rot and self._dct_codebook_rot is not None and self._dct_codebook_indices_rot is not None:
+                cb_idx = self._dct_codebook_indices_rot[idx].long()
+                code = self._dct_codebook_rot[cb_idx]
+                if self._dct_codebook_residual_rot is not None:
+                    return code + self._dct_codebook_residual_rot[idx]
+                return code
+            return self._trajectory_coeffs_rot[idx] if self._trajectory_coeffs_rot is not None else None
+        return None
+
     def dct_displacement(self, time_tensor):
         coeffs = self._get_dct_coeffs("pos")
+        if coeffs is None:
+            return None
+        basis_sel = self._select_dct_basis(time_tensor)
+        if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
+            basis_sel = basis_sel.expand(coeffs.shape[0], -1)
+        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+
+    def dct_displacement_masked(self, time_tensor, idx):
+        coeffs = self._get_dct_coeffs_for_indices("pos", idx)
         if coeffs is None:
             return None
         basis_sel = self._select_dct_basis(time_tensor)
@@ -405,8 +444,26 @@ class GaussianModel:
             basis_sel = basis_sel.expand(coeffs.shape[0], -1)
         return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
 
+    def dct_scale_delta_masked(self, time_tensor, idx):
+        coeffs = self._get_dct_coeffs_for_indices("scale", idx)
+        if coeffs is None:
+            return None
+        basis_sel = self._select_dct_basis(time_tensor)
+        if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
+            basis_sel = basis_sel.expand(coeffs.shape[0], -1)
+        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+
     def dct_rot_delta(self, time_tensor):
         coeffs = self._get_dct_coeffs("rot")
+        if coeffs is None:
+            return None
+        basis_sel = self._select_dct_basis(time_tensor)
+        if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
+            basis_sel = basis_sel.expand(coeffs.shape[0], -1)
+        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+
+    def dct_rot_delta_masked(self, time_tensor, idx):
+        coeffs = self._get_dct_coeffs_for_indices("rot", idx)
         if coeffs is None:
             return None
         basis_sel = self._select_dct_basis(time_tensor)

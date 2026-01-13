@@ -553,13 +553,6 @@ if __name__ == "__main__":
     parser.add_argument("--dct_lr_decay_gamma", type=float, default=0.3)
     parser.add_argument("--distill_unfreeze_all", action="store_true", default=False)
     parser.add_argument("--distill_unfreeze_lr_mult", type=float, default=0.01)
-    parser.add_argument("--dct_use_codebook_pos", action="store_true", default=False)
-    parser.add_argument("--dct_use_codebook_scale", action="store_true", default=False)
-    parser.add_argument("--dct_use_codebook_rot", action="store_true", default=False)
-    parser.add_argument("--dct_codebook_size_pos", type=int, default=256)
-    parser.add_argument("--dct_codebook_size_scale", type=int, default=256)
-    parser.add_argument("--dct_codebook_size_rot", type=int, default=256)
-    parser.add_argument("--dct_expand_codebook", action="store_true", default=False)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     if args.configs:

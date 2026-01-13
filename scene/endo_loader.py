@@ -586,6 +586,8 @@ class Hamlyn_Dataset(object):
         
         imgs, masks, depths = \
             [torch.stack(lst, dim=0) for lst in [imgs, masks, depths]]
+        imgs_interp = imgs
+        masks_interp = masks
         
         # Fruther process
         # crop the images, masks and depths
@@ -661,6 +663,8 @@ class Hamlyn_Dataset(object):
         if split == 'train': idxs = self.train_idxs
         elif split == 'test': idxs = self.test_idxs
         elif split == 'video':
+            idxs = self.video_idxs
+        elif split == 'interp':
             idxs = self.video_idxs
         else:
             raise ValueError(f"{split} has not been implemented.")

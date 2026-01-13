@@ -79,6 +79,7 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dct_expand_codebook", action="store_true", default=False)
     ap.add_argument("--fp16_static", action="store_true", default=False)
+    ap.add_argument("--dct_masked", action="store_true", default=False)
     ap.add_argument("--json", action="store_true", help="print JSON only")
     args = ap.parse_args()
 
@@ -107,6 +108,8 @@ def main():
     cfg = load_cfg_args(model_path)
     if cfg is None:
         raise RuntimeError(f"Missing cfg_args under {model_path}. Run training/render once to generate it.")
+    # Always use the passed model_path even if cfg_args points elsewhere.
+    setattr(cfg, "model_path", str(model_path))
 
     # Build minimal arg objects similarly to render.py/train.py
     # (Most repos use ModelParams/PipelineParams.extract(Namespace))
@@ -119,6 +122,8 @@ def main():
         setattr(cfg, "dct_expand_codebook", True)
     if args.fp16_static:
         setattr(cfg, "fp16_static", True)
+    if args.dct_masked:
+        setattr(cfg, "dct_masked", True)
     dataset = model_params.extract(cfg) if hasattr(model_params, "extract") else cfg
     pipe = pipe_params.extract(cfg) if hasattr(pipe_params, "extract") else cfg
     hyper = hyper_params.extract(cfg) if hasattr(hyper_params, "extract") else cfg

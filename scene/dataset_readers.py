@@ -283,7 +283,7 @@ def readHamlynInfo(datadir, mode):
     train_cam_infos = endo_dataset.format_infos(split="train")
     test_cam_infos = endo_dataset.format_infos(split="test")
     video_cam_infos = endo_dataset.format_infos(split="video")
-    interp_cam_infos = endo_dataset.format_infos(split='interp')
+    # interp split is not used downstream for training/rendering
     
     # get normalizations
     nerf_normalization = getNerfppNorm(train_cam_infos)
@@ -308,7 +308,6 @@ def readHamlynInfo(datadir, mode):
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            video_cameras=video_cam_infos,
-                           interp_cameras=interp_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
                            maxtime=maxtime)
