@@ -31,6 +31,7 @@ from torchmetrics.functional.regression import pearson_corrcoef
 import lpips
 from utils.scene_utils import render_training_image
 from time import time
+import torch.nn.functional as F
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
 try:
@@ -334,6 +335,16 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     teacher_gaussians = GaussianModel(dataset.sh_degree, teacher_hyper)
     teacher_scene = Scene(teacher_dataset, teacher_gaussians, load_iteration=args.distill_iteration, shuffle=False, load_coarse=args.no_fine)
     iteration = teacher_scene.loaded_iter
+    video_cam_map = {}
+    try:
+        for cam in teacher_scene.getVideoCameras():
+            try:
+                key = int(cam.image_name)
+            except Exception:
+                key = cam.uid
+            video_cam_map[key] = cam
+    except Exception:
+        video_cam_map = {}
 
     # Student gaussians (DCT)
     student_gaussians = GaussianModel(dataset.sh_degree, hyper)
@@ -439,6 +450,79 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     viewpoint_stack = teacher_scene.getTrainCameras()
 
+    flow_root = None
+    mask_root = None
+    if args.distill_flow_weight > 0:
+        if args.distill_flow_dir:
+            flow_root = args.distill_flow_dir
+        else:
+            auto = os.path.join(dataset.source_path, "flow_fwd")
+            if os.path.isdir(auto):
+                flow_root = auto
+        if args.distill_flow_mask_dir:
+            mask_root = args.distill_flow_mask_dir
+        else:
+            auto = os.path.join(dataset.source_path, "mask_occ")
+            if os.path.isdir(auto):
+                mask_root = auto
+        if flow_root is None:
+            print("[WARN] distill_flow_weight>0 but flow_dir not found; flow loss disabled.")
+            args.distill_flow_weight = 0.0
+
+    flow_cache = {}
+    mask_cache = {}
+    cache_order = []
+
+    def _resolve_npy(root_dir, idx):
+        if root_dir is None:
+            return None
+        if not os.path.isdir(root_dir):
+            return None
+        for name in (f"{idx:06d}.npy", f"{idx}.npy"):
+            path = os.path.join(root_dir, name)
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _load_cached(cache, path, key, max_items=4):
+        if key in cache:
+            return cache[key]
+        if path is None:
+            return None
+        arr = np.load(path)
+        cache[key] = arr
+        cache_order.append(key)
+        if len(cache_order) > max_items:
+            old = cache_order.pop(0)
+            cache.pop(old, None)
+        return arr
+
+    def _sample_map(map_hw2, coords_xy):
+        # map_hw2: [H, W, C], coords_xy: [N, 2] in pixel
+        h, w = map_hw2.shape[:2]
+        device = coords_xy.device
+        inp = torch.from_numpy(map_hw2).to(device=device, dtype=torch.float32)
+        if inp.dim() == 2:
+            inp = inp.unsqueeze(-1)
+        inp = inp.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+        x = coords_xy[:, 0].clamp(0, w - 1)
+        y = coords_xy[:, 1].clamp(0, h - 1)
+        grid_x = (x / (w - 1)) * 2.0 - 1.0
+        grid_y = (y / (h - 1)) * 2.0 - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 1, 2)
+        sampled = F.grid_sample(inp, grid, align_corners=True, mode="bilinear", padding_mode="border")
+        sampled = sampled.view(inp.shape[1], -1).transpose(0, 1)
+        return sampled
+
+    def _project_points(points, cam):
+        ones = torch.ones((points.shape[0], 1), device=points.device, dtype=points.dtype)
+        pts_h = torch.cat([points, ones], dim=1)
+        proj = pts_h @ cam.full_proj_transform.to(points.device)
+        ndc = proj[:, :3] / (proj[:, 3:4] + 1e-8)
+        x = (ndc[:, 0] * 0.5 + 0.5) * cam.image_width
+        y = (ndc[:, 1] * 0.5 + 0.5) * cam.image_height
+        return torch.stack([x, y], dim=1)
+
     ema_loss_for_log = 0.0
     lr_decay_steps = set(args.dct_lr_decay_iters)
     if not lr_decay_steps:
@@ -472,6 +556,104 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
                 loss += grad_w * _grad_loss(student_img.unsqueeze(0), teacher_img.unsqueeze(0), mask.unsqueeze(0))
         if student_gaussians.dct_use_gate and args.dct_gate_lambda > 0 and student_gaussians._dct_log_alpha is not None:
             loss = loss + args.dct_gate_lambda * torch.sigmoid(student_gaussians._dct_log_alpha).sum()
+
+        if args.distill_flow_weight > 0 and flow_root and (iteration % args.distill_flow_every == 0):
+            try:
+                frame_idx = int(viewpoint_cam.image_name)
+            except Exception:
+                frame_idx = int(viewpoint_cam.uid)
+            max_t = max(1, int(student_gaussians.dct_T))
+            if frame_idx + 1 < max_t:
+                flow_path = _resolve_npy(flow_root, frame_idx)
+                flow_arr = _load_cached(flow_cache, flow_path, ("flow", frame_idx))
+                if flow_arr is not None:
+                    mask_arr = None
+                    if mask_root:
+                        mask_path = _resolve_npy(mask_root, frame_idx)
+                        mask_arr = _load_cached(mask_cache, mask_path, ("mask", frame_idx))
+
+                    vis = student_pkg.get("visibility_filter", None)
+                    radii = student_pkg.get("radii", None)
+                    if vis is not None:
+                        vis_idx = vis.nonzero(as_tuple=False).squeeze(1)
+                        if vis_idx.numel() > 0:
+                            if args.distill_flow_topk > 0 and vis_idx.numel() > args.distill_flow_topk and radii is not None:
+                                topk = torch.topk(radii[vis_idx], args.distill_flow_topk).indices
+                                sel_idx = vis_idx[topk]
+                            else:
+                                sel_idx = vis_idx
+
+                            t0 = frame_idx / (max_t - 1) if max_t > 1 else 0.0
+                            t1 = (frame_idx + 1) / (max_t - 1) if max_t > 1 else 0.0
+                            time_t = torch.tensor(t0, device=student_img.device, dtype=student_img.dtype)
+                            time_t1 = torch.tensor(t1, device=student_img.device, dtype=student_img.dtype)
+
+                            disp_t = student_gaussians.dct_displacement_masked(time_t, sel_idx)
+                            disp_t1 = student_gaussians.dct_displacement_masked(time_t1, sel_idx)
+                            if disp_t is not None and disp_t1 is not None:
+                                xyz_sel = student_gaussians.get_xyz[sel_idx]
+                                pos_t = xyz_sel + disp_t
+                                pos_t1 = xyz_sel + disp_t1
+                                cam_t = video_cam_map.get(frame_idx, viewpoint_cam)
+                                cam_t1 = video_cam_map.get(frame_idx + 1, cam_t)
+                                coords_t = _project_points(pos_t, cam_t)
+                                coords_t1 = _project_points(pos_t1, cam_t1)
+                                pred_flow = coords_t1 - coords_t
+                                flow_sample = _sample_map(flow_arr, coords_t)
+                                if flow_sample.shape[1] > 2:
+                                    flow_sample = flow_sample[:, :2]
+                                mask_vals = None
+                                if mask_arr is not None:
+                                    mask_vals = _sample_map(mask_arr, coords_t)[:, 0]
+                                in_bounds = (
+                                    (coords_t[:, 0] >= 0) & (coords_t[:, 0] <= cam_t.image_width - 1) &
+                                    (coords_t[:, 1] >= 0) & (coords_t[:, 1] <= cam_t.image_height - 1)
+                                )
+                                weight = in_bounds.float()
+                                if mask_vals is not None:
+                                    weight = weight * mask_vals.clamp(0.0, 1.0)
+                                if args.distill_flow_use_radii and radii is not None:
+                                    r = radii[sel_idx].detach()
+                                    weight = weight * (r / (r.max() + 1e-6))
+                                diff = torch.abs(pred_flow - flow_sample)
+                                err = diff.sum(dim=1)
+                                denom = weight.sum().clamp(min=1e-6)
+                                flow_loss = (err * weight).sum() / denom
+                                loss = loss + args.distill_flow_weight * flow_loss
+
+        if args.distill_accel_weight > 0:
+            try:
+                frame_idx = int(viewpoint_cam.image_name)
+            except Exception:
+                frame_idx = int(viewpoint_cam.uid)
+            max_t = max(1, int(student_gaussians.dct_T))
+            if 0 < frame_idx < max_t - 1:
+                vis = student_pkg.get("visibility_filter", None)
+                if vis is not None:
+                    vis_idx = vis.nonzero(as_tuple=False).squeeze(1)
+                    if vis_idx.numel() > 0:
+                        if args.distill_accel_topk > 0 and vis_idx.numel() > args.distill_accel_topk and student_pkg.get("radii", None) is not None:
+                            topk = torch.topk(student_pkg["radii"][vis_idx], args.distill_accel_topk).indices
+                            sel_idx = vis_idx[topk]
+                        else:
+                            sel_idx = vis_idx
+                        t_prev = (frame_idx - 1) / (max_t - 1)
+                        t_curr = frame_idx / (max_t - 1)
+                        t_next = (frame_idx + 1) / (max_t - 1)
+                        time_prev = torch.tensor(t_prev, device=student_img.device, dtype=student_img.dtype)
+                        time_curr = torch.tensor(t_curr, device=student_img.device, dtype=student_img.dtype)
+                        time_next = torch.tensor(t_next, device=student_img.device, dtype=student_img.dtype)
+                        disp_prev = student_gaussians.dct_displacement_masked(time_prev, sel_idx)
+                        disp_curr = student_gaussians.dct_displacement_masked(time_curr, sel_idx)
+                        disp_next = student_gaussians.dct_displacement_masked(time_next, sel_idx)
+                        if disp_prev is not None and disp_curr is not None and disp_next is not None:
+                            xyz_sel = student_gaussians.get_xyz[sel_idx]
+                            pos_prev = xyz_sel + disp_prev
+                            pos_curr = xyz_sel + disp_curr
+                            pos_next = xyz_sel + disp_next
+                            accel = pos_next - 2.0 * pos_curr + pos_prev
+                            accel_loss = (accel ** 2).sum(dim=1).mean()
+                            loss = loss + args.distill_accel_weight * accel_loss
 
         loss.backward()
         optimizer.step()
@@ -595,6 +777,14 @@ if __name__ == "__main__":
     parser.add_argument("--dct_lr_decay_gamma", type=float, default=0.3)
     parser.add_argument("--distill_unfreeze_all", action="store_true", default=False)
     parser.add_argument("--distill_unfreeze_lr_mult", type=float, default=0.01)
+    parser.add_argument("--distill_flow_dir", type=str, default="")
+    parser.add_argument("--distill_flow_mask_dir", type=str, default="")
+    parser.add_argument("--distill_flow_weight", type=float, default=0.0)
+    parser.add_argument("--distill_flow_every", type=int, default=1)
+    parser.add_argument("--distill_flow_topk", type=int, default=50000)
+    parser.add_argument("--distill_flow_use_radii", action="store_true", default=False)
+    parser.add_argument("--distill_accel_weight", type=float, default=0.0)
+    parser.add_argument("--distill_accel_topk", type=int, default=50000)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     if args.configs:
