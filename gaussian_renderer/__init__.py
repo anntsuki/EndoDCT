@@ -77,6 +77,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         if getattr(pc, "use_dct_deform", False) and getattr(pc, "_trajectory_coeffs", None) is not None:
             if getattr(pc, "dct_masked", False) and deformation_point is not None:
+                bg_lowk = int(getattr(pc, "dct_masked_lowk", 0))
+                use_bg_lowk = bg_lowk > 0 and bg_lowk < getattr(pc, "dct_k", bg_lowk)
                 mask_idx = deformation_point.nonzero(as_tuple=False).squeeze(1)
                 if mask_idx.numel() > 0:
                     disp = pc.dct_displacement_masked(time_scalar, mask_idx)
@@ -97,6 +99,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     scales_deform = scales[deformation_point]
                     rotations_deform = rotations[deformation_point]
                     opacity_deform = opacity[deformation_point]
+                if use_bg_lowk:
+                    bg_mask = ~deformation_point
+                    bg_idx = bg_mask.nonzero(as_tuple=False).squeeze(1)
+                    if bg_idx.numel() > 0:
+                        disp_bg = pc.dct_displacement_masked_lowk(time_scalar, bg_idx, bg_lowk)
+                        means3D_bg = means3D[bg_mask] + disp_bg
+                    else:
+                        means3D_bg = means3D[bg_mask]
             else:
                 disp = pc.dct_displacement(time_scalar)
                 means3D_deform = means3D[deformation_point] + disp[deformation_point]
@@ -136,7 +146,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rotations_final[deformation_point] =  rotations_deform
     scales_final[deformation_point] =  scales_deform
     opacity_final[deformation_point] = opacity_deform
-    means3D_final[~deformation_point] = means3D[~deformation_point]
+    if getattr(pc, "dct_masked", False) and deformation_point is not None:
+        bg_lowk = int(getattr(pc, "dct_masked_lowk", 0))
+        use_bg_lowk = bg_lowk > 0 and bg_lowk < getattr(pc, "dct_k", bg_lowk)
+        if use_bg_lowk and "means3D_bg" in locals():
+            means3D_final[~deformation_point] = means3D_bg
+        else:
+            means3D_final[~deformation_point] = means3D[~deformation_point]
+    else:
+        means3D_final[~deformation_point] = means3D[~deformation_point]
     rotations_final[~deformation_point] = rotations[~deformation_point]
     scales_final[~deformation_point] = scales[~deformation_point]
     opacity_final[~deformation_point] = opacity[~deformation_point]

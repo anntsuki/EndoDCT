@@ -64,10 +64,16 @@ class GaussianModel:
         self.dct_expand_codebook = getattr(args, "dct_expand_codebook", False)
         self.fp16_static = getattr(args, "fp16_static", False)
         self.dct_masked = getattr(args, "dct_masked", False)
+        self.dct_masked_lowk = int(getattr(args, "dct_masked_lowk", 0))
+        self.dct_point_gate = getattr(args, "dct_point_gate", False)
+        self.dct_point_gate_init = float(getattr(args, "dct_point_gate_init", 2.0))
+        self.dct_point_gate_threshold = float(getattr(args, "dct_point_gate_threshold", 0.5))
+        self.dct_point_gate_ste = bool(getattr(args, "dct_point_gate_ste", True))
         self._dct_basis = None
         self._trajectory_coeffs = None
         self._trajectory_coeffs_scale = None
         self._trajectory_coeffs_rot = None
+        self._dct_point_logit = None
         self._dct_log_alpha = None
         self._dct_codebook_pos = None
         self._dct_codebook_scale = None
@@ -213,6 +219,10 @@ class GaussianModel:
                 self._dct_log_alpha = nn.Parameter(
                     torch.full((self.dct_k,), self.dct_gate_init, device="cuda", dtype=torch.float32).requires_grad_(True)
                 )
+            if self.dct_point_gate:
+                self._dct_point_logit = nn.Parameter(
+                    torch.full((self.get_xyz.shape[0],), self.dct_point_gate_init, device="cuda", dtype=torch.float32).requires_grad_(True)
+                )
         self._apply_fp16_static()
 
     def _apply_fp16_static(self):
@@ -251,6 +261,8 @@ class GaussianModel:
                 l.append({'params': [self._trajectory_coeffs_rot], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_coeffs_rot"})
             if self.dct_use_gate and self._dct_log_alpha is not None:
                 l.append({'params': [self._dct_log_alpha], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_gate"})
+            if self.dct_point_gate and self._dct_point_logit is not None:
+                l.append({'params': [self._dct_point_logit], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_point_gate"})
         if self.use_dct_deform and self.dct_use_codebook_pos and self._dct_codebook_pos is not None:
             l.append({'params': [self._dct_codebook_pos], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_codebook_pos"})
             if self._dct_codebook_residual_pos is not None:
@@ -294,7 +306,7 @@ class GaussianModel:
                 lr = self.deformation_scheduler_args(iteration)
                 param_group['lr'] = lr
                 # return lr
-            elif param_group["name"] in ("dct_coeffs", "dct_gate"):
+            elif param_group["name"] in ("dct_coeffs", "dct_gate", "dct_point_gate"):
                 lr = self.deformation_scheduler_args(iteration)
                 param_group['lr'] = lr
             elif param_group["name"] in ("dct_coeffs_scale", "dct_coeffs_rot"):
@@ -340,6 +352,23 @@ class GaussianModel:
         if self._dct_log_alpha is None:
             return None
         return torch.sigmoid(self._dct_log_alpha)
+
+    def dct_point_gate_prob(self, idx=None):
+        if self._dct_point_logit is None:
+            return None
+        gate = torch.sigmoid(self._dct_point_logit)
+        if idx is not None:
+            gate = gate[idx]
+        return gate
+
+    def dct_point_gate_mask(self, idx=None):
+        gate = self.dct_point_gate_prob(idx)
+        if gate is None or not self.dct_point_gate:
+            return None
+        if self.dct_point_gate_ste:
+            hard = (gate > self.dct_point_gate_threshold).to(gate.dtype)
+            gate = hard - gate.detach() + gate
+        return gate
 
     def _select_dct_basis(self, time_tensor):
         basis = self._ensure_dct_basis(time_tensor.device)
@@ -424,7 +453,11 @@ class GaussianModel:
         basis_sel = self._select_dct_basis(time_tensor)
         if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
             basis_sel = basis_sel.expand(coeffs.shape[0], -1)
-        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        disp = torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        gate = self.dct_point_gate_mask()
+        if gate is not None:
+            disp = disp * gate.unsqueeze(-1)
+        return disp
 
     def dct_displacement_masked(self, time_tensor, idx):
         coeffs = self._get_dct_coeffs_for_indices("pos", idx)
@@ -433,7 +466,27 @@ class GaussianModel:
         basis_sel = self._select_dct_basis(time_tensor)
         if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
             basis_sel = basis_sel.expand(coeffs.shape[0], -1)
-        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        disp = torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        gate = self.dct_point_gate_mask(idx)
+        if gate is not None:
+            disp = disp * gate.unsqueeze(-1)
+        return disp
+
+    def dct_displacement_masked_lowk(self, time_tensor, idx, k_low):
+        coeffs = self._get_dct_coeffs_for_indices("pos", idx)
+        if coeffs is None:
+            return None
+        k_low = max(1, min(int(k_low), coeffs.shape[1]))
+        coeffs = coeffs[:, :k_low, :]
+        basis_sel = self._select_dct_basis(time_tensor)
+        if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
+            basis_sel = basis_sel.expand(coeffs.shape[0], -1)
+        basis_sel = basis_sel[:, :k_low]
+        disp = torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        gate = self.dct_point_gate_mask(idx)
+        if gate is not None:
+            disp = disp * gate.unsqueeze(-1)
+        return disp
 
     def dct_scale_delta(self, time_tensor):
         coeffs = self._get_dct_coeffs("scale")
@@ -442,7 +495,11 @@ class GaussianModel:
         basis_sel = self._select_dct_basis(time_tensor)
         if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
             basis_sel = basis_sel.expand(coeffs.shape[0], -1)
-        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        disp = torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        gate = self.dct_point_gate_mask()
+        if gate is not None:
+            disp = disp * gate.unsqueeze(-1)
+        return disp
 
     def dct_scale_delta_masked(self, time_tensor, idx):
         coeffs = self._get_dct_coeffs_for_indices("scale", idx)
@@ -451,7 +508,11 @@ class GaussianModel:
         basis_sel = self._select_dct_basis(time_tensor)
         if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
             basis_sel = basis_sel.expand(coeffs.shape[0], -1)
-        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        disp = torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        gate = self.dct_point_gate_mask(idx)
+        if gate is not None:
+            disp = disp * gate.unsqueeze(-1)
+        return disp
 
     def dct_rot_delta(self, time_tensor):
         coeffs = self._get_dct_coeffs("rot")
@@ -460,7 +521,11 @@ class GaussianModel:
         basis_sel = self._select_dct_basis(time_tensor)
         if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
             basis_sel = basis_sel.expand(coeffs.shape[0], -1)
-        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        disp = torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        gate = self.dct_point_gate_mask()
+        if gate is not None:
+            disp = disp * gate.unsqueeze(-1)
+        return disp
 
     def dct_rot_delta_masked(self, time_tensor, idx):
         coeffs = self._get_dct_coeffs_for_indices("rot", idx)
@@ -469,7 +534,11 @@ class GaussianModel:
         basis_sel = self._select_dct_basis(time_tensor)
         if basis_sel.shape[0] == 1 and coeffs.shape[0] != 1:
             basis_sel = basis_sel.expand(coeffs.shape[0], -1)
-        return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        disp = torch.einsum("nkd,nk->nd", coeffs, basis_sel)
+        gate = self.dct_point_gate_mask(idx)
+        if gate is not None:
+            disp = disp * gate.unsqueeze(-1)
+        return disp
 
     def _expand_codebook(self, kind):
         if kind == "pos":
@@ -600,6 +669,10 @@ class GaussianModel:
             log_alpha = dct.get("log_alpha", None)
             if log_alpha is not None:
                 self._dct_log_alpha = nn.Parameter(log_alpha.to("cuda").requires_grad_(True))
+            point_logit = dct.get("point_logit", None)
+            if point_logit is not None:
+                self._dct_point_logit = nn.Parameter(point_logit.to("cuda").requires_grad_(True))
+                self.dct_point_gate = True
             if self.dct_expand_codebook:
                 with torch.no_grad():
                     self._expand_codebook("pos")
@@ -616,6 +689,7 @@ class GaussianModel:
                 "coeffs_scale": self._trajectory_coeffs_scale.detach().cpu() if self._trajectory_coeffs_scale is not None else None,
                 "coeffs_rot": self._trajectory_coeffs_rot.detach().cpu() if self._trajectory_coeffs_rot is not None else None,
                 "log_alpha": self._dct_log_alpha.detach().cpu() if self._dct_log_alpha is not None else None,
+                "point_logit": self._dct_point_logit.detach().cpu() if self._dct_point_logit is not None else None,
                 "dct_k": self.dct_k,
                 "dct_T": self.dct_T,
             }
@@ -694,6 +768,10 @@ class GaussianModel:
                 self._dct_log_alpha = nn.Parameter(
                     torch.full((self.dct_k,), self.dct_gate_init, device="cuda", dtype=torch.float32).requires_grad_(True)
                 )
+            if self.dct_point_gate and self._dct_point_logit is None:
+                self._dct_point_logit = nn.Parameter(
+                    torch.full((self.get_xyz.shape[0],), self.dct_point_gate_init, device="cuda", dtype=torch.float32).requires_grad_(True)
+                )
 
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
@@ -771,6 +849,8 @@ class GaussianModel:
             self._trajectory_coeffs_scale = optimizable_tensors["dct_coeffs_scale"]
         if self.use_dct_deform and "dct_coeffs_rot" in optimizable_tensors:
             self._trajectory_coeffs_rot = optimizable_tensors["dct_coeffs_rot"]
+        if self.dct_point_gate and "dct_point_gate" in optimizable_tensors:
+            self._dct_point_logit = optimizable_tensors["dct_point_gate"]
         if self.dct_use_codebook_pos and "dct_residual_pos" in optimizable_tensors:
             self._dct_codebook_residual_pos = optimizable_tensors["dct_residual_pos"]
         if self.dct_use_codebook_scale and "dct_residual_scale" in optimizable_tensors:
@@ -839,6 +919,8 @@ class GaussianModel:
                         d["dct_residual_rot"] = torch.zeros((new_xyz.shape[0], self.dct_k, 4), device="cuda")
                 else:
                     d["dct_coeffs_rot"] = torch.zeros((new_xyz.shape[0], self.dct_k, 4), device="cuda")
+            if self.dct_point_gate:
+                d["dct_point_gate"] = torch.full((new_xyz.shape[0],), self.dct_point_gate_init, device="cuda")
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -859,6 +941,8 @@ class GaussianModel:
             self._dct_codebook_residual_scale = optimizable_tensors["dct_residual_scale"]
         if self.dct_use_codebook_rot and "dct_residual_rot" in optimizable_tensors:
             self._dct_codebook_residual_rot = optimizable_tensors["dct_residual_rot"]
+        if self.dct_point_gate and "dct_point_gate" in optimizable_tensors:
+            self._dct_point_logit = optimizable_tensors["dct_point_gate"]
         if self.dct_use_codebook_pos and self._dct_codebook_indices_pos is not None:
             new_idx = torch.zeros((new_xyz.shape[0],), device="cuda", dtype=self._dct_codebook_indices_pos.dtype)
             self._dct_codebook_indices_pos = torch.cat([self._dct_codebook_indices_pos, new_idx], dim=0)

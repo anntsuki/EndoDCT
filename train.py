@@ -156,6 +156,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         tv_loss = 0.03 * (img_tvloss + depth_tvloss)
         
         loss = Ll1 + depth_loss + tv_loss
+        gate_lambda = float(getattr(opt, "dct_point_gate_lambda", 0.0))
+        if gate_lambda > 0 and gaussians.dct_point_gate and gaussians._dct_point_logit is not None:
+            gate_prob = gaussians.dct_point_gate_prob()
+            if gate_prob is not None:
+                loss += gate_lambda * gate_prob.mean()
 
         psnr_ = psnr(rendered_images, gt_images, masks).mean().double()        
         
@@ -334,6 +339,10 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
         student_gaussians._dct_log_alpha = torch.nn.Parameter(
             torch.full((student_gaussians.dct_k,), student_gaussians.dct_gate_init, device="cuda", dtype=torch.float32).requires_grad_(True)
         )
+    if student_gaussians.dct_point_gate and student_gaussians._dct_point_logit is None:
+        student_gaussians._dct_point_logit = torch.nn.Parameter(
+            torch.full((student_gaussians.get_xyz.shape[0],), student_gaussians.dct_point_gate_init, device="cuda", dtype=torch.float32).requires_grad_(True)
+        )
 
     # Freeze everything except DCT params
     for p in [student_gaussians._xyz, student_gaussians._features_dc, student_gaussians._features_rest,
@@ -351,6 +360,8 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
         params.append(student_gaussians._trajectory_coeffs)
     if student_gaussians.dct_use_gate and student_gaussians._dct_log_alpha is not None:
         params.append(student_gaussians._dct_log_alpha)
+    if student_gaussians.dct_point_gate and student_gaussians._dct_point_logit is not None:
+        params.append(student_gaussians._dct_point_logit)
     if student_gaussians._trajectory_coeffs_scale is not None:
         params.append(student_gaussians._trajectory_coeffs_scale)
     if student_gaussians._trajectory_coeffs_rot is not None:
@@ -383,6 +394,7 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
         id(student_gaussians._dct_codebook_rot): base_lr * args.dct_lr_mult,
         id(student_gaussians._dct_codebook_residual_rot): base_lr * args.dct_lr_mult,
         id(student_gaussians._dct_log_alpha): base_lr * args.dct_lr_mult,
+        id(student_gaussians._dct_point_logit): base_lr * args.dct_lr_mult,
         id(student_gaussians._trajectory_coeffs_scale): base_lr * args.dct_lr_mult,
         id(student_gaussians._trajectory_coeffs_rot): base_lr * args.dct_lr_mult,
         id(student_gaussians._xyz): opt.position_lr_init * args.dct_xyz_lr_mult,
@@ -430,6 +442,11 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
             loss = l1
         if student_gaussians.dct_use_gate and args.dct_gate_lambda > 0 and student_gaussians._dct_log_alpha is not None:
             loss = loss + args.dct_gate_lambda * torch.sigmoid(student_gaussians._dct_log_alpha).sum()
+        gate_lambda = float(getattr(args, "dct_point_gate_lambda", 0.0))
+        if gate_lambda > 0 and student_gaussians.dct_point_gate and student_gaussians._dct_point_logit is not None:
+            gate_prob = student_gaussians.dct_point_gate_prob()
+            if gate_prob is not None:
+                loss = loss + gate_lambda * gate_prob.mean()
 
         loss.backward()
         optimizer.step()
