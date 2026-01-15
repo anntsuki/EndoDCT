@@ -118,6 +118,10 @@ class ModelHiddenParams(ParamGroup):
         self.dct_expand_codebook = False
         self.fp16_static = False
         self.dct_masked = False
+        self.use_anchor_dct = False
+        self.anchor_k = 4
+        self.anchor_residual_k = 0
+        self.anchor_residual_tail = True
         super().__init__(parser, "ModelHiddenParams")
         
 class OptimizationParams(ParamGroup):
@@ -139,6 +143,8 @@ class OptimizationParams(ParamGroup):
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
+        self.grad_loss_weight = 0.0
+        self.grad_loss_start = 0
         self.percent_dense = 0.01
         self.lambda_dssim = 0
         self.lambda_lpips = 0

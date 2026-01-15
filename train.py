@@ -39,6 +39,27 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+
+def _grad_loss(pred, target, mask=None):
+    grad_pred_x = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    grad_pred_y = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    grad_tgt_x = target[:, :, :, 1:] - target[:, :, :, :-1]
+    grad_tgt_y = target[:, :, 1:, :] - target[:, :, :-1, :]
+    if mask is not None:
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        if mask.shape[1] == 1:
+            mask = mask.repeat(1, pred.shape[1], 1, 1)
+        mask_x = mask[:, :, :, 1:]
+        mask_y = mask[:, :, 1:, :]
+        loss_x = torch.abs(grad_pred_x - grad_tgt_x) * mask_x
+        loss_y = torch.abs(grad_pred_y - grad_tgt_y) * mask_y
+        denom = mask_x.sum() + mask_y.sum()
+        if denom <= 0:
+            return (torch.abs(grad_pred_x - grad_tgt_x).mean() + torch.abs(grad_pred_y - grad_tgt_y).mean()) * 0.5
+        return (loss_x.sum() + loss_y.sum()) / (denom + 1e-6)
+    return (torch.abs(grad_pred_x - grad_tgt_x).mean() + torch.abs(grad_pred_y - grad_tgt_y).mean()) * 0.5
+
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, stage, tb_writer, train_iter, timer):
@@ -156,6 +177,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         tv_loss = 0.03 * (img_tvloss + depth_tvloss)
         
         loss = Ll1 + depth_loss + tv_loss
+        grad_w = float(getattr(opt, "grad_loss_weight", 0.0))
+        if grad_w > 0:
+            grad_start = int(getattr(opt, "grad_loss_start", 0))
+            if iteration >= grad_start:
+                loss += grad_w * _grad_loss(rendered_images, gt_images, masks)
 
         psnr_ = psnr(rendered_images, gt_images, masks).mean().double()        
         
@@ -304,6 +330,7 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     teacher_dataset.model_path = teacher_model_path
     teacher_hyper = copy.deepcopy(hyper)
     teacher_hyper.use_dct_deform = False
+    teacher_hyper.use_anchor_dct = False
     teacher_gaussians = GaussianModel(dataset.sh_degree, teacher_hyper)
     teacher_scene = Scene(teacher_dataset, teacher_gaussians, load_iteration=args.distill_iteration, shuffle=False, load_coarse=args.no_fine)
     iteration = teacher_scene.loaded_iter
@@ -318,6 +345,9 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     if student_gaussians.dct_use_codebook_pos:
         if student_gaussians._dct_codebook_pos is None or student_gaussians._dct_codebook_indices_pos is None:
             raise RuntimeError("DCT pos codebook requested but missing in dct_coeffs.pth")
+    elif student_gaussians.use_anchor_dct:
+        if student_gaussians._anchor_coeffs is None:
+            raise RuntimeError("use_anchor_dct=True but anchor_dct.pth is missing or invalid.")
     elif student_gaussians._trajectory_coeffs is None:
         student_gaussians._trajectory_coeffs = torch.nn.Parameter(
             torch.zeros((student_gaussians.get_xyz.shape[0], student_gaussians.dct_k, 3), device="cuda").requires_grad_(True)
@@ -348,7 +378,12 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
         if student_gaussians._dct_codebook_residual_pos is not None:
             params.append(student_gaussians._dct_codebook_residual_pos)
     else:
-        params.append(student_gaussians._trajectory_coeffs)
+        if student_gaussians.use_anchor_dct and student_gaussians._anchor_coeffs is not None:
+            params.append(student_gaussians._anchor_coeffs)
+            if student_gaussians._anchor_residual_coeffs is not None:
+                params.append(student_gaussians._anchor_residual_coeffs)
+        else:
+            params.append(student_gaussians._trajectory_coeffs)
     if student_gaussians.dct_use_gate and student_gaussians._dct_log_alpha is not None:
         params.append(student_gaussians._dct_log_alpha)
     if student_gaussians._trajectory_coeffs_scale is not None:
@@ -376,6 +411,8 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
     base_lr = opt.deformation_lr_init * student_gaussians.spatial_lr_scale
     lr_map = {
         id(student_gaussians._trajectory_coeffs): base_lr * args.dct_lr_mult,
+        id(student_gaussians._anchor_coeffs): base_lr * args.dct_lr_mult,
+        id(student_gaussians._anchor_residual_coeffs): base_lr * args.dct_lr_mult,
         id(student_gaussians._dct_codebook_pos): base_lr * args.dct_lr_mult,
         id(student_gaussians._dct_codebook_residual_pos): base_lr * args.dct_lr_mult,
         id(student_gaussians._dct_codebook_scale): base_lr * args.dct_lr_mult,
@@ -428,6 +465,11 @@ def distill_dct_training(dataset, hyper, opt, pipe, testing_iterations, saving_i
             loss = l1_w * l1 + ssim_w * (1.0 - ssim_val)
         else:
             loss = l1
+        grad_w = float(getattr(opt, "grad_loss_weight", 0.0))
+        if grad_w > 0:
+            grad_start = int(getattr(opt, "grad_loss_start", 0))
+            if iteration >= grad_start:
+                loss += grad_w * _grad_loss(student_img.unsqueeze(0), teacher_img.unsqueeze(0), mask.unsqueeze(0))
         if student_gaussians.dct_use_gate and args.dct_gate_lambda > 0 and student_gaussians._dct_log_alpha is not None:
             loss = loss + args.dct_gate_lambda * torch.sigmoid(student_gaussians._dct_log_alpha).sum()
 

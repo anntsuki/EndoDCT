@@ -64,10 +64,19 @@ class GaussianModel:
         self.dct_expand_codebook = getattr(args, "dct_expand_codebook", False)
         self.fp16_static = getattr(args, "fp16_static", False)
         self.dct_masked = getattr(args, "dct_masked", False)
+        self.use_anchor_dct = getattr(args, "use_anchor_dct", False)
+        self.anchor_k = int(getattr(args, "anchor_k", 4))
+        self.anchor_residual_k = int(getattr(args, "anchor_residual_k", 0))
+        self.anchor_residual_tail = bool(getattr(args, "anchor_residual_tail", True))
         self._dct_basis = None
         self._trajectory_coeffs = None
         self._trajectory_coeffs_scale = None
         self._trajectory_coeffs_rot = None
+        self._anchor_positions = None
+        self._anchor_coeffs = None
+        self._anchor_indices = None
+        self._anchor_weights = None
+        self._anchor_residual_coeffs = None
         self._dct_log_alpha = None
         self._dct_codebook_pos = None
         self._dct_codebook_scale = None
@@ -198,9 +207,10 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
         if self.use_dct_deform:
-            self._trajectory_coeffs = nn.Parameter(
-                torch.zeros((self.get_xyz.shape[0], self.dct_k, 3), device="cuda").requires_grad_(True)
-            )
+            if not self.use_anchor_dct:
+                self._trajectory_coeffs = nn.Parameter(
+                    torch.zeros((self.get_xyz.shape[0], self.dct_k, 3), device="cuda").requires_grad_(True)
+                )
             if self.dct_use_scale:
                 self._trajectory_coeffs_scale = nn.Parameter(
                     torch.zeros((self.get_xyz.shape[0], self.dct_k, 3), device="cuda").requires_grad_(True)
@@ -243,8 +253,13 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
-        if self.use_dct_deform and self._trajectory_coeffs is not None:
-            l.append({'params': [self._trajectory_coeffs], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_coeffs"})
+        if self.use_dct_deform:
+            if self.use_anchor_dct and self._anchor_coeffs is not None:
+                l.append({'params': [self._anchor_coeffs], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "anchor_dct_coeffs"})
+                if self._anchor_residual_coeffs is not None:
+                    l.append({'params': [self._anchor_residual_coeffs], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "anchor_dct_residuals"})
+            elif self._trajectory_coeffs is not None:
+                l.append({'params': [self._trajectory_coeffs], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_coeffs"})
             if self._trajectory_coeffs_scale is not None:
                 l.append({'params': [self._trajectory_coeffs_scale], 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "dct_coeffs_scale"})
             if self._trajectory_coeffs_rot is not None:
@@ -295,6 +310,12 @@ class GaussianModel:
                 param_group['lr'] = lr
                 # return lr
             elif param_group["name"] in ("dct_coeffs", "dct_gate"):
+                lr = self.deformation_scheduler_args(iteration)
+                param_group['lr'] = lr
+            elif param_group["name"] == "anchor_dct_coeffs":
+                lr = self.deformation_scheduler_args(iteration)
+                param_group['lr'] = lr
+            elif param_group["name"] == "anchor_dct_residuals":
                 lr = self.deformation_scheduler_args(iteration)
                 param_group['lr'] = lr
             elif param_group["name"] in ("dct_coeffs_scale", "dct_coeffs_rot"):
@@ -418,6 +439,21 @@ class GaussianModel:
         return None
 
     def dct_displacement(self, time_tensor):
+        if self.use_anchor_dct and self._anchor_coeffs is not None and self._anchor_indices is not None and self._anchor_weights is not None:
+            basis_sel = self._select_dct_basis(time_tensor)
+            if basis_sel.dim() == 1:
+                basis_sel = basis_sel.unsqueeze(0)
+            anchor_disp = torch.einsum("akd,nk->nad", self._anchor_coeffs, basis_sel).squeeze(0)
+            idx = self._anchor_indices.long()
+            w = self._anchor_weights.to(anchor_disp)
+            disp = (anchor_disp[idx] * w.unsqueeze(-1)).sum(dim=1)
+            if self._anchor_residual_coeffs is not None and self.anchor_residual_k > 0:
+                if self.anchor_residual_tail:
+                    basis_res = basis_sel[:, -self.anchor_residual_k:]
+                else:
+                    basis_res = basis_sel[:, :self.anchor_residual_k]
+                disp = disp + torch.einsum("nkd,nk->nd", self._anchor_residual_coeffs, basis_res)
+            return disp
         coeffs = self._get_dct_coeffs("pos")
         if coeffs is None:
             return None
@@ -427,6 +463,11 @@ class GaussianModel:
         return torch.einsum("nkd,nk->nd", coeffs, basis_sel)
 
     def dct_displacement_masked(self, time_tensor, idx):
+        if self.use_anchor_dct and self._anchor_coeffs is not None and self._anchor_indices is not None and self._anchor_weights is not None:
+            disp = self.dct_displacement(time_tensor)
+            if disp is None:
+                return None
+            return disp[idx]
         coeffs = self._get_dct_coeffs_for_indices("pos", idx)
         if coeffs is None:
             return None
@@ -605,6 +646,31 @@ class GaussianModel:
                     self._expand_codebook("pos")
                     self._expand_codebook("scale")
                     self._expand_codebook("rot")
+        if self.use_anchor_dct:
+            anchor_path = os.path.join(path, "anchor_dct.pth")
+            if os.path.exists(anchor_path):
+                anchor = torch.load(anchor_path, map_location="cuda")
+                anchor_pos = anchor.get("anchor_pos", None)
+                if anchor_pos is not None:
+                    self._anchor_positions = anchor_pos.to("cuda").float()
+                coeffs = anchor.get("anchor_coeffs", None)
+                if coeffs is not None:
+                    self._anchor_coeffs = nn.Parameter(coeffs.to("cuda").float().requires_grad_(True))
+                anchor_idx = anchor.get("anchor_idx", None)
+                if anchor_idx is not None:
+                    self._anchor_indices = anchor_idx.to("cuda").long()
+                anchor_w = anchor.get("anchor_w", None)
+                if anchor_w is not None:
+                    self._anchor_weights = anchor_w.to("cuda").float()
+                self.anchor_k = int(anchor.get("anchor_k", self.anchor_k))
+                self.anchor_residual_k = int(anchor.get("residual_k", self.anchor_residual_k))
+                self.anchor_residual_tail = bool(anchor.get("residual_tail", self.anchor_residual_tail))
+                residuals = anchor.get("residual_coeffs", None)
+                if residuals is not None:
+                    self._anchor_residual_coeffs = nn.Parameter(residuals.to("cuda").float().requires_grad_(True))
+                self.use_dct_deform = True
+            else:
+                raise FileNotFoundError(f"Missing anchor_dct.pth in {path} while use_anchor_dct=True")
 
     def save_deformation(self, path):
         torch.save(self._deformation.state_dict(),os.path.join(path, "deformation.pth"))
@@ -635,6 +701,20 @@ class GaussianModel:
                 dct["residuals_rot"] = self._dct_codebook_residual_rot.detach().to(torch.float16).cpu() if self._dct_codebook_residual_rot is not None else None
                 dct["coeffs_rot"] = None
             torch.save(dct, os.path.join(path, "dct_coeffs.pth"))
+        if self.use_anchor_dct and self._anchor_coeffs is not None and self._anchor_indices is not None and self._anchor_weights is not None:
+            anchor = {
+                "anchor_pos": self._anchor_positions.detach().cpu() if self._anchor_positions is not None else None,
+                "anchor_coeffs": self._anchor_coeffs.detach().cpu(),
+                "residual_coeffs": self._anchor_residual_coeffs.detach().cpu() if self._anchor_residual_coeffs is not None else None,
+                "anchor_idx": self._anchor_indices.detach().cpu(),
+                "anchor_w": self._anchor_weights.detach().cpu(),
+                "anchor_k": self.anchor_k,
+                "residual_k": self.anchor_residual_k,
+                "residual_tail": self.anchor_residual_tail,
+                "dct_k": self.dct_k,
+                "dct_T": self.dct_T,
+            }
+            torch.save(anchor, os.path.join(path, "anchor_dct.pth"))
 
     def load_ply(self, path):
         plydata = PlyData.read(path)
@@ -678,10 +758,11 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self._apply_fp16_static()
         self.active_sh_degree = self.max_sh_degree
-        if self.use_dct_deform and self._trajectory_coeffs is None:
-            self._trajectory_coeffs = nn.Parameter(
-                torch.zeros((self.get_xyz.shape[0], self.dct_k, 3), device="cuda").requires_grad_(True)
-            )
+        if self.use_dct_deform:
+            if self._trajectory_coeffs is None and not self.use_anchor_dct:
+                self._trajectory_coeffs = nn.Parameter(
+                    torch.zeros((self.get_xyz.shape[0], self.dct_k, 3), device="cuda").requires_grad_(True)
+                )
             if self.dct_use_scale and self._trajectory_coeffs_scale is None:
                 self._trajectory_coeffs_scale = nn.Parameter(
                     torch.zeros((self.get_xyz.shape[0], self.dct_k, 3), device="cuda").requires_grad_(True)
@@ -742,6 +823,9 @@ class GaussianModel:
             if group.get("name", "") in ("dct_codebook_pos", "dct_codebook_scale", "dct_codebook_rot"):
                 optimizable_tensors[group["name"]] = group["params"][0]
                 continue
+            if group.get("name", "") == "anchor_dct_coeffs":
+                optimizable_tensors[group["name"]] = group["params"][0]
+                continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -771,6 +855,8 @@ class GaussianModel:
             self._trajectory_coeffs_scale = optimizable_tensors["dct_coeffs_scale"]
         if self.use_dct_deform and "dct_coeffs_rot" in optimizable_tensors:
             self._trajectory_coeffs_rot = optimizable_tensors["dct_coeffs_rot"]
+        if self.use_anchor_dct and "anchor_dct_residuals" in optimizable_tensors:
+            self._anchor_residual_coeffs = optimizable_tensors["anchor_dct_residuals"]
         if self.dct_use_codebook_pos and "dct_residual_pos" in optimizable_tensors:
             self._dct_codebook_residual_pos = optimizable_tensors["dct_residual_pos"]
         if self.dct_use_codebook_scale and "dct_residual_scale" in optimizable_tensors:
@@ -827,6 +913,8 @@ class GaussianModel:
                     d["dct_residual_pos"] = torch.zeros((new_xyz.shape[0], self.dct_k, 3), device="cuda")
             else:
                 d["dct_coeffs"] = torch.zeros((new_xyz.shape[0], self.dct_k, 3), device="cuda")
+            if self.use_anchor_dct and self._anchor_residual_coeffs is not None and self.anchor_residual_k > 0:
+                d["anchor_dct_residuals"] = torch.zeros((new_xyz.shape[0], self.anchor_residual_k, 3), device="cuda")
             if self.dct_use_scale:
                 if self.dct_use_codebook_scale:
                     if self._dct_codebook_residual_scale is not None:
