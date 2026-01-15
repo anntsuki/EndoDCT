@@ -75,7 +75,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if stage == "coarse" :
         means3D_deform, scales_deform, rotations_deform, opacity_deform = means3D, scales, rotations, opacity
     else:
-        if getattr(pc, "use_dct_deform", False) and getattr(pc, "_trajectory_coeffs", None) is not None:
+        has_anchor = getattr(pc, "use_anchor_dct", False) and getattr(pc, "_anchor_coeffs", None) is not None
+        if getattr(pc, "use_dct_deform", False) and (has_anchor or getattr(pc, "_trajectory_coeffs", None) is not None):
             if getattr(pc, "dct_masked", False) and deformation_point is not None:
                 bg_lowk = int(getattr(pc, "dct_masked_lowk", 0))
                 use_bg_lowk = bg_lowk > 0 and bg_lowk < getattr(pc, "dct_k", bg_lowk)
