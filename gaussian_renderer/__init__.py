@@ -75,53 +75,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if stage == "coarse" :
         means3D_deform, scales_deform, rotations_deform, opacity_deform = means3D, scales, rotations, opacity
     else:
-        has_anchor = getattr(pc, "use_anchor_dct", False) and getattr(pc, "_anchor_coeffs", None) is not None
-        if getattr(pc, "use_dct_deform", False) and (has_anchor or getattr(pc, "_trajectory_coeffs", None) is not None):
-            if getattr(pc, "dct_masked", False) and deformation_point is not None:
-                bg_lowk = int(getattr(pc, "dct_masked_lowk", 0))
-                use_bg_lowk = bg_lowk > 0 and bg_lowk < getattr(pc, "dct_k", bg_lowk)
-                mask_idx = deformation_point.nonzero(as_tuple=False).squeeze(1)
-                if mask_idx.numel() > 0:
-                    disp = pc.dct_displacement_masked(time_scalar, mask_idx)
-                    means3D_deform = means3D[deformation_point] + disp
-                    scales_deform = scales[deformation_point]
-                    rotations_deform = rotations[deformation_point]
-                    if getattr(pc, "dct_use_scale", False):
-                        ds = pc.dct_scale_delta_masked(time_scalar, mask_idx)
-                        if ds is not None:
-                            scales_deform = scales_deform + ds
-                    if getattr(pc, "dct_use_rot", False):
-                        dr = pc.dct_rot_delta_masked(time_scalar, mask_idx)
-                        if dr is not None:
-                            rotations_deform = rotations_deform + dr
-                    opacity_deform = opacity[deformation_point]
-                else:
-                    means3D_deform = means3D[deformation_point]
-                    scales_deform = scales[deformation_point]
-                    rotations_deform = rotations[deformation_point]
-                    opacity_deform = opacity[deformation_point]
-                if use_bg_lowk:
-                    bg_mask = ~deformation_point
-                    bg_idx = bg_mask.nonzero(as_tuple=False).squeeze(1)
-                    if bg_idx.numel() > 0:
-                        disp_bg = pc.dct_displacement_masked_lowk(time_scalar, bg_idx, bg_lowk)
-                        means3D_bg = means3D[bg_mask] + disp_bg
-                    else:
-                        means3D_bg = means3D[bg_mask]
-            else:
-                disp = pc.dct_displacement(time_scalar)
-                means3D_deform = means3D[deformation_point] + disp[deformation_point]
-                scales_deform = scales[deformation_point]
-                rotations_deform = rotations[deformation_point]
-                if getattr(pc, "dct_use_scale", False):
-                    ds = pc.dct_scale_delta(time_scalar)
-                    if ds is not None:
-                        scales_deform = scales_deform + ds[deformation_point]
-                if getattr(pc, "dct_use_rot", False):
-                    dr = pc.dct_rot_delta(time_scalar)
-                    if dr is not None:
-                        rotations_deform = rotations_deform + dr[deformation_point]
-                opacity_deform = opacity[deformation_point]
+        if getattr(pc, "use_dct_deform", False) and getattr(pc, "_trajectory_coeffs", None) is not None:
+            disp = pc.dct_displacement(time_scalar)
+            mask_f = deformation_point.float().unsqueeze(-1)
+            means3D_deform = means3D + disp * mask_f
+            scales_deform = scales
+            rotations_deform = rotations
+            if getattr(pc, "dct_use_scale", False):
+                ds = pc.dct_scale_delta(time_scalar)
+                if ds is not None:
+                    scales_deform = scales_deform + ds * mask_f
+            if getattr(pc, "dct_use_rot", False):
+                dr = pc.dct_rot_delta(time_scalar)
+                if dr is not None:
+                    rotations_deform = rotations_deform + dr * mask_f
+            opacity_deform = opacity
         else:
             time = time_scalar.repeat(means3D.shape[0], 1)
             means3D_deform, scales_deform, rotations_deform, opacity_deform = pc._deformation(means3D[deformation_point], scales[deformation_point], 
@@ -143,26 +111,55 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales_deform = scales_deform.to(scales_final.dtype)
     if opacity_deform is not None:
         opacity_deform = opacity_deform.to(opacity_final.dtype)
-    means3D_final[deformation_point] =  means3D_deform
-    rotations_final[deformation_point] =  rotations_deform
-    scales_final[deformation_point] =  scales_deform
-    opacity_final[deformation_point] = opacity_deform
-    if getattr(pc, "dct_masked", False) and deformation_point is not None:
-        bg_lowk = int(getattr(pc, "dct_masked_lowk", 0))
-        use_bg_lowk = bg_lowk > 0 and bg_lowk < getattr(pc, "dct_k", bg_lowk)
-        if use_bg_lowk and "means3D_bg" in locals():
-            means3D_final[~deformation_point] = means3D_bg
-        else:
-            means3D_final[~deformation_point] = means3D[~deformation_point]
+    # Dense blend to avoid index_put_ overhead
+    if deformation_point is not None:
+        mask_f = deformation_point.float().unsqueeze(-1)
+        means3D_final = means3D + (means3D_deform - means3D) * mask_f
+        scales_final = scales + (scales_deform - scales) * mask_f
+        rotations_final = rotations + (rotations_deform - rotations) * mask_f
+        opacity_final = opacity + (opacity_deform - opacity) * mask_f
     else:
-        means3D_final[~deformation_point] = means3D[~deformation_point]
-    rotations_final[~deformation_point] = rotations[~deformation_point]
-    scales_final[~deformation_point] = scales[~deformation_point]
-    opacity_final[~deformation_point] = opacity[~deformation_point]
+        means3D_final = means3D_deform
+        scales_final = scales_deform
+        rotations_final = rotations_deform
+        opacity_final = opacity_deform
 
     scales_final = pc.scaling_activation(scales_final)
     rotations_final = pc.rotation_activation(rotations_final)
     opacity = pc.opacity_activation(opacity)
+
+    # 预剔除：渲染前丢掉低贡献点（推理加速，不改变训练默认行为）
+    means2D_final = means2D
+    mask = None
+    if getattr(pc, "pre_cull", False):
+        op_thr = float(getattr(pc, "pre_cull_opacity", 0.0))
+        min_r = float(getattr(pc, "pre_cull_min_radius", 0.0))
+        if op_thr > 0.0:
+            mask = opacity.squeeze(-1) >= op_thr
+        else:
+            mask = torch.ones_like(opacity.squeeze(-1), dtype=torch.bool)
+
+        if min_r > 0.0:
+            pts = means3D_final.float()
+            ones = torch.ones((pts.shape[0], 1), device=pts.device, dtype=pts.dtype)
+            pts_h = torch.cat([pts, ones], dim=1)
+            view = viewpoint_camera.world_view_transform.to(pts.device, dtype=pts.dtype)
+            pts_cam = pts_h @ view.T
+            z = pts_cam[:, 2].abs().clamp_min(1e-6)
+            fx = 0.5 * float(viewpoint_camera.image_width) / math.tan(float(viewpoint_camera.FoVx) * 0.5)
+            max_scale = scales_final.max(dim=1).values.float()
+            radius = max_scale * fx / z
+            mask = mask & (radius >= min_r)
+
+        if mask.any():
+            means3D_final = means3D_final[mask]
+            scales_final = scales_final[mask]
+            rotations_final = rotations_final[mask]
+            opacity = opacity[mask]
+            means2D_final = means2D[mask]
+        else:
+            # 如果全被剔除，就退化为不剔除，避免空输入
+            mask = None
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -180,6 +177,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
 
+    if mask is not None:
+        if shs is not None:
+            shs = shs[mask]
+        if colors_precomp is not None:
+            colors_precomp = colors_precomp[mask]
+
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # Rasterizer expects float32 inputs; ensure fp16_static does not break dtype.
     def _fp32(x):
@@ -195,7 +198,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rendered_image, radii, depth = rasterizer(
         means3D = means3D_final,
-        means2D = means2D,
+        means2D = means2D_final,
         shs = shs,
         colors_precomp = colors_precomp,
         opacities = opacity,

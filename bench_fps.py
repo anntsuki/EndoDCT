@@ -80,7 +80,9 @@ def main():
     ap.add_argument("--dct_expand_codebook", action="store_true", default=False)
     ap.add_argument("--fp16_static", action="store_true", default=False)
     ap.add_argument("--dct_masked", action="store_true", default=False)
-    ap.add_argument("--dct_masked_lowk", type=int, default=0)
+    ap.add_argument("--pre_cull", action="store_true", default=False)
+    ap.add_argument("--pre_cull_opacity", type=float, default=0.0)
+    ap.add_argument("--pre_cull_min_radius", type=float, default=0.0)
     ap.add_argument("--json", action="store_true", help="print JSON only")
     args = ap.parse_args()
 
@@ -125,8 +127,10 @@ def main():
         setattr(cfg, "fp16_static", True)
     if args.dct_masked:
         setattr(cfg, "dct_masked", True)
-    if args.dct_masked_lowk:
-        setattr(cfg, "dct_masked_lowk", args.dct_masked_lowk)
+    if args.pre_cull:
+        setattr(cfg, "pre_cull", True)
+        setattr(cfg, "pre_cull_opacity", args.pre_cull_opacity)
+        setattr(cfg, "pre_cull_min_radius", args.pre_cull_min_radius)
     dataset = model_params.extract(cfg) if hasattr(model_params, "extract") else cfg
     pipe = pipe_params.extract(cfg) if hasattr(pipe_params, "extract") else cfg
     hyper = hyper_params.extract(cfg) if hasattr(hyper_params, "extract") else cfg
