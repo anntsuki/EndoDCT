@@ -15,7 +15,7 @@
 
 ## Visualization Results
 
-![](figures/results.png)
+![](figures/results.jng)
 
 ---
 
