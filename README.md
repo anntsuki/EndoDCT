@@ -16,7 +16,7 @@ This repository is a modified implementation based on EndoGaussian for real-time
 
 ## Visualization Results
 
-![](figures/results.png)
+![](figures/results.jpg)
 
 ---
 
