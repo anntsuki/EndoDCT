@@ -2,6 +2,7 @@
 
 **EndoDCT: Real-time Dynamic Endoscopic Scene Reconstruction via DCT-based Trajectory Deformation**
 
+This repository is a modified implementation based on EndoGaussian for real-time dynamic endoscopic scene reconstruction. The structure follows the style of the LGS repository, with a minimal reproducible pipeline below.
 
 ---
 
@@ -15,7 +16,7 @@
 
 ## Visualization Results
 
-![](figures/results.jpg)
+![](figures/results.png)
 
 ---
 
@@ -55,45 +56,84 @@ Notes:
 - Each sequence should contain `images/`, `depth/`, and `masks/`.
 - Data loaders are defined in `scene/endo_loader.py`.
 
+Dataset sources:
+- **EndoNeRF**: https://github.com/med-air/EndoNeRF  
+  We use `pulling_soft_tissues` and `cutting_tissues_twice`.
+- **SCARED**: https://endovissub2019-scared.grand-challenge.org/  
+  Use `dataset_1/keyframe_1~3` after preprocessing.
+- **Hamlyn (ForPlane)**: https://github.com/Loping151/ForPlane  
+  Example: `hamlyn_seq1`.
+
 ---
 
 ## Environment
 
-```bash
-# Activate environment before running
-conda activate gaussian_splatting
+PowerShell multiline (copy-paste ready):
+
+```powershell
+conda create -n EndoDCT python=3.7 -y `
+  && conda activate EndoDCT `
+  && pip install -r requirements.txt `
+  && pip install -e submodules/depth-diff-gaussian-rasterization `
+  && pip install -e submodules/simple-knn
 ```
 
 ---
 
-## Training
+## Training (Single Dataset)
 
-Example (EndoNeRF, pulling):
+Step 1: Train the baseline EndoGaussian (teacher).
 
-```bash
-python train.py --configs arguments/endonerf/pulling.py --model_path output/endonerf/pulling
+```powershell
+python train.py --configs arguments/endonerf/pulling.py `
+  --model_path output/endonerf/pulling
+```
+
+Step 2: Distill into EndoDCT (best setting).
+
+```powershell
+python train.py --configs arguments/endonerf/pulling.py `
+  --model_path output/endonerf/pulling_dct_sr2 `
+  --distill_dct --teacher_model_path output/endonerf/pulling `
+  --distill_iteration -1 --distill_iterations 6000 `
+  --use_dct_deform --dct_use_scale --dct_use_rot `
+  --dct_k 16 --dct_T 63 `
+  --dct_lr_mult 140 --dct_xyz_lr_mult 0.01 `
+  --distill_unfreeze_all --distill_unfreeze_lr_mult 0.01 `
+  --distill_ssim_weight 0.0
 ```
 
 ---
 
-## Rendering & Evaluation
+## Training (All Datasets)
 
-```bash
-# Render (generates test/ours_xxx)
-python render.py --model_path output/endonerf/pulling --iteration 3000 --skip_train --skip_video --configs arguments/endonerf/pulling.py
+Batch training with the same setting (output to `output1/`):
 
-# Metrics (PSNR/SSIM/LPIPS)
-python metrics.py -m output/endonerf/pulling
-
-# FPS benchmark
-python bench_fps.py -m output/endonerf/pulling --iteration 3000 --split test --views 1 --warmup 10 --iters 200 --json
+```powershell
+python batch_dct_sr2.py --output_root output1 `
+  --distill_iterations 6000 --dct_k 16 --dct_lr_mult 140 --dct_xyz_lr_mult 0.01 `
+  --distill_unfreeze_all --distill_unfreeze_lr_mult 0.01 `
+  --distill_ssim_weight 0.0 --dct_use_scale --dct_use_rot
 ```
 
 ---
 
-## Batch Evaluation (Excel Output)
+## Rendering & Evaluation (Single Dataset)
 
-```bash
-# Evaluation only (no training)
-python batch_dct_sr2.py --output_root output1 --skip_train --bench_warmup 50 --bench_iters 500 --out_xlsx im4.xlsx
+```powershell
+python render.py --model_path output/endonerf/pulling_dct_sr2 `
+  --iteration 6000 --skip_train --skip_video `
+  --configs arguments/endonerf/pulling.py --use_dct_deform --dct_use_scale --dct_use_rot
+
+python metrics.py -m output/endonerf/pulling_dct_sr2 ; `
+  python bench_fps.py -m output/endonerf/pulling_dct_sr2 --iteration 6000 --split test --views 1 --warmup 50 --iters 500 --json
+```
+
+---
+
+## Evaluation (All Datasets)
+
+```powershell
+python batch_dct_sr2.py --output_root output1 --skip_train `
+  --bench_warmup 50 --bench_iters 500 --out_xlsx im4.xlsx
 ```
