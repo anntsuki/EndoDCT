@@ -57,13 +57,15 @@ Notes:
 - Data loaders are defined in `scene/endo_loader.py`.
 
 Dataset sources:
-- **EndoNeRF**: https://github.com/med-air/EndoNeRF  
-  We use `pulling_soft_tissues` and `cutting_tissues_twice`.
-- **SCARED**: https://endovissub2019-scared.grand-challenge.org/  
-  Use `dataset_1/keyframe_1~3` after preprocessing.
-- **Hamlyn (ForPlane)**: https://github.com/Loping151/ForPlane  
-  Example: `hamlyn_seq1`.
+Look https://github.com/CUHK-AIM-Group/EndoGaussian
+EndoNeRF:
+The dataset provided in EndoNeRF is used. You can download and process the dataset from their website (https://github.com/med-air/EndoNeRF). We use the two accessible clips including 'pulling_soft_tissues' and 'cutting_tissues_twice'.
 
+SCARED:
+The dataset provided in SCARED is used. To obtain a link to the data and code release, sign the challenge rules and email them to max.allan@intusurg.com. You will receive a temporary link to download the data and code. Follow MICCAI_challenge_preprocess to extract data.
+
+Hamlyn (new):
+The dataset provided in Forplane is used. Thanks for their efforts.
 ---
 
 ## Environment
