@@ -2,8 +2,6 @@
 
 **EndoDCT: Real-time Dynamic Endoscopic Scene Reconstruction via DCT-based Trajectory Deformation**
 
-This repository is a modified implementation based on EndoGaussian for real-time dynamic endoscopic scene reconstruction. The structure follows the style of the LGS repository, with a minimal reproducible pipeline below.
-
 ---
 
 ## Method Overview
